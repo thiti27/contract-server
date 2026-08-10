@@ -1,0 +1,20 @@
+version: "3.8"
+name: uat-econtract-server-container
+services:
+  nodejs:
+    build: ./
+    image: uat-econtract-nodejs-server:1.0
+    container_name: uat-econtract-nodejs-container
+    restart: always
+    volumes:
+      - "./econtract-container-volumes/storage:/usr/src/app/storage"
+    ports:
+      - 1312:1312
+    deploy:
+      resources:
+        limits:
+          memory: 500M
+        reservations:
+          memory: 200M
+    environment:
+      NODE_ENV: production
