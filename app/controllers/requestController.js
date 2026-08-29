@@ -3,13 +3,28 @@ import {
   DOCUMENT_TYPE_KEYS,
   updateEditableFields,
   upsertDocuments,
+  upsertActionFiles,
   computeCommentRole,
   insertComment,
+  normalizeReferContractNo,
+  hasConfidentialAccess,
 } from '../../helpers/contractRequestHelper.js';
 import { NEW_REQUEST_STATUS, EDIT_ACTION_STATUS } from '../utils/statusGroups.js';
 import { toDateOnly } from '../utils/dateUtils.js';
 import { ApiError } from '../utils/apiError.js';
 import { handleApprovalError } from '../middleware/errorHandler.js';
+
+// Amend/Renew/Terminate/Claim Note/Cancel — all 5 show the Reference Item's own
+// contract_no from the moment they're created (Save Draft or Send Request):
+//
+// - Amend/Renew/Terminate/Claim Note: a placeholder only — Approver 3's approval
+//   replaces it with a real, newly-minted sub number (generateContractNo in
+//   approvalController.js).
+// - Cancel: stays this way permanently, never replaced with anything else — a Cancel
+//   request is never itself a contract, it's the record of what it references (the
+//   EXACT contract the user clicked Cancel on, whether that's a base contract or one of
+//   its own revisions — see referContractNo below).
+const REFER_CONTRACT_NO_PLACEHOLDER_REMARKS = ['amend', 'renew', 'terminate', 'claim', 'cancel'];
 
 // ---------------------------------------------------------------------------
 // New contract requests (draft or sent) from the New Request form
@@ -19,20 +34,43 @@ export async function createRequest(req, res) {
   const status = NEW_REQUEST_STATUS[body.status] || 'Saved';
   const approvers = body.approvers || [];
   const payments = body.payments || {};
+  const remark = body.remark || 'new';
+
+  // Renew/Amend/Terminate/Claim Note: normalized to the base contract number (e.g.
+  // "DSST01-2026-01" -> "DSST01-2026") — see normalizeReferContractNo — so the revision
+  // counter for that base continues instead of nesting.
+  //
+  // Cancel: deliberately NOT normalized. It targets whichever exact contract (base or
+  // revision) the client opened it from, verbatim — cancelling a revision must cancel
+  // THAT contract, not silently redirect to its unrelated base. linked_master_id is
+  // trusted as sent for the same reason: it's simply the id of whichever row this
+  // request was opened from (the frontend already fetched that row's own data to
+  // pre-fill the form, so there's no other row it could legitimately mean), and that's
+  // exactly the row Approver 3's completion (approvalController.js) must flip to
+  // 'Cancelled' — the row actually being cancelled, not some resolved ancestor of it.
+  const referContractNo = remark === 'cancel' ? (body.referContractNo || null) : normalizeReferContractNo(body.referContractNo);
+  const linkedMasterId = body.linkedMasterId || null;
+  const contractNo = REFER_CONTRACT_NO_PLACEHOLDER_REMARKS.includes(remark) ? referContractNo : null;
 
   const requestId = await insert(
     `INSERT INTO contract_requests (
        status, confidentiality, contract_type_id, contract_purpose, other_specify,
-       supplier_name, contract_year, request_date, delivery_date, location, warranty_period, refer_contract_no,
-       brief_description, total_net_price, vat, currency, trade_term, payment_other,
+       supplier_name, contract_year, request_date, delivery_date, location, warranty_period, refer_contract_no, linked_master_id,
+       contract_no,
+       brief_description, action_background, action_detail,
+       new_contract_start_date, new_contract_end_date, action_effective_date, cancel_reason,
+       total_net_price, vat, currency, trade_term, payment_other,
        payment1, payment2, payment3, payment4, payment5, payment6, payment7, payment8,
        requestor_name, requestor_section, remark,
        approver1_em_id, approver2_em_id, approver3_em_id,
        created_by, updated_by, updated_name, updated_at
      ) VALUES (
        :status, :confidentiality, :contractTypeId, :contractPurpose, :otherSpecify,
-       :supplierName, YEAR(:requestDate), :requestDate, :deliveryDate, :location, :warrantyPeriod, :referContractNo,
-       :briefDescription, :totalNetPrice, :vat, :currency, :tradeTerm, :paymentOther,
+       :supplierName, YEAR(:requestDate), :requestDate, :deliveryDate, :location, :warrantyPeriod, :referContractNo, :linkedMasterId,
+       :contractNo,
+       :briefDescription, :actionBackground, :actionDetail,
+       :newContractStartDate, :newContractEndDate, :actionEffectiveDate, :cancelReason,
+       :totalNetPrice, :vat, :currency, :tradeTerm, :paymentOther,
        :payment1, :payment2, :payment3, :payment4, :payment5, :payment6, :payment7, :payment8,
        :requestorName, :requestorSection, :remark,
        :approver1EmId, :approver2EmId, :approver3EmId,
@@ -49,8 +87,16 @@ export async function createRequest(req, res) {
       deliveryDate: body.deliveryDate || null,
       location: body.location || null,
       warrantyPeriod: body.warrantyPeriod || null,
-      referContractNo: body.referContractNo || null,
+      referContractNo,
+      linkedMasterId,
+      contractNo,
       briefDescription: body.briefDescription || null,
+      actionBackground: body.actionBackground || null,
+      actionDetail: body.actionDetail || null,
+      newContractStartDate: body.newContractStartDate || null,
+      newContractEndDate: body.newContractEndDate || null,
+      actionEffectiveDate: body.actionEffectiveDate || null,
+      cancelReason: body.cancelReason || null,
       totalNetPrice: body.totalNetPrice || null,
       vat: body.vat || null,
       currency: body.currency || null,
@@ -66,7 +112,7 @@ export async function createRequest(req, res) {
       payment8: payments.payment8 || null,
       requestorName: body.requestorName || '',
       requestorSection: body.requestorSection || '',
-      remark: body.remark || 'new',
+      remark,
       // approvers[] is UI row order top-to-bottom (Manager, Supervisor, Supervisor), but
       // the approval sequence runs bottom-up (index 2 approves first as Approver 1, index
       // 0/Manager signs off last as Approver 3) — see the comment above ApprovalSection's
@@ -86,6 +132,7 @@ export async function createRequest(req, res) {
   }
 
   await upsertDocuments(requestId, body.documents, body.emId);
+  await upsertActionFiles(requestId, body.actionFiles, body.emId);
 
   res.status(201).json({ id: requestId, status });
 }
@@ -98,6 +145,25 @@ export async function getRequest(req, res) {
   const rows = await select(`SELECT * FROM contract_requests WHERE id = :id AND deleted_at IS NULL`, { id });
   const row = rows[0];
   if (!row) return res.status(404).json({ message: 'Contract request not found' });
+  if (!hasConfidentialAccess(row, req.user)) {
+    return res.status(403).json({ message: 'You do not have permission to access this contract.' });
+  }
+
+  // Renew's "Original Period" is never stored on this row itself — it's always read
+  // fresh from the contract this request renews (linked_master_id), so it can never
+  // drift out of sync with what that original contract's own signed period says.
+  let originalContractStartDate = null;
+  let originalContractEndDate = null;
+  if (row.remark === 'renew' && row.linked_master_id) {
+    const masterRows = await select(
+      `SELECT contract_start_date, expire_date FROM contract_requests WHERE id = :masterId`,
+      { masterId: row.linked_master_id }
+    );
+    if (masterRows.length) {
+      originalContractStartDate = masterRows[0].contract_start_date;
+      originalContractEndDate = masterRows[0].expire_date;
+    }
+  }
 
   const docRows = await select(
     `SELECT crd.id AS documentId, crd.document_type AS documentType, crd.checked,
@@ -127,6 +193,14 @@ export async function getRequest(req, res) {
     { id }
   );
 
+  const actionFileRows = await select(
+    `SELECT f.id, f.file_name AS fileName, f.extension
+     FROM contract_request_action_files craf
+     JOIN file_uploads f ON f.id = craf.file_upload_id AND f.active = 1 AND f.deleted_at IS NULL
+     WHERE craf.contract_request_id = :id AND craf.active = 1 AND craf.deleted_at IS NULL`,
+    { id }
+  );
+
   res.json({
     id: row.id,
     status: row.status,
@@ -142,7 +216,22 @@ export async function getRequest(req, res) {
     location: row.location || '',
     warrantyPeriod: row.warranty_period || '',
     referContractNo: row.refer_contract_no || '',
+    linkedMasterId: row.linked_master_id || null,
     briefDescription: row.brief_description || '',
+    actionBackground: row.action_background || '',
+    actionDetail: row.action_detail || '',
+    actionFiles: actionFileRows,
+    actionEffectiveDate: toDateOnly(row.action_effective_date),
+    newContractStartDate: toDateOnly(row.new_contract_start_date),
+    newContractEndDate: toDateOnly(row.new_contract_end_date),
+    cancelReason: row.cancel_reason || '',
+    // The row's own signed period (Upload Sign Contract) — distinct from Renew's
+    // "Original Period" above, which belongs to the contract THIS row renews, not to
+    // this row's own eventual signed dates.
+    contractStartDate: toDateOnly(row.contract_start_date),
+    expireDate: toDateOnly(row.expire_date),
+    originalContractStartDate: toDateOnly(originalContractStartDate),
+    originalContractEndDate: toDateOnly(originalContractEndDate),
     totalNetPrice: row.total_net_price != null ? String(row.total_net_price) : '',
     vat: row.vat || '',
     currency: row.currency || '',

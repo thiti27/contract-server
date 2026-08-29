@@ -32,7 +32,7 @@ export const NEW_REQUEST_STATUS = { draft: 'Saved', submitted: 'Waiting Approver
 // already at — editing an in-flight request doesn't restart its approval stage.
 export const EDIT_ACTION_STATUS = {
   'save-change': null,
-  cancel: 'Canceled',
+  cancel: 'Cancelled',
   'save-draft': 'Saved',
   'send-request': 'Waiting Approver 1',
 };

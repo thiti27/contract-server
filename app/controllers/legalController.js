@@ -27,7 +27,8 @@ async function insertLegalHistory(id, action, by, emId, options = {}) {
 // separate, narrower helper rather than a shared one: it only needs `status`.)
 async function lockRequest(id, options) {
   const rows = await select(
-    `SELECT status FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
+    `SELECT status, requestor_name AS requestorName, created_by AS createdBy
+     FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
     { id },
     options
   );
@@ -105,11 +106,11 @@ async function markNoNeedLegalRequest(id, body) {
 // which literal action/status they record. Both require a comment (enforced
 // client-side too — red border/scroll — but re-checked here since the server never
 // trusts client-side validation alone).
-// 'Canceled' (single L) reuses the exact status string already registered elsewhere
-// in the system (HISTORY_STATUSES, StatusBadge, the Edit modal's own Cancel action —
-// see EDIT_ACTION_STATUS in app/utils/statusGroups.js) rather than introducing a
-// second, differently spelled "cancelled" status.
-const CANCEL_OR_TERMINATE_STATUS = { Cancel: 'Canceled', Terminate: 'Terminated' };
+// 'Cancelled' reuses the exact status string already registered elsewhere in the
+// system (HISTORY_STATUSES, StatusBadge, the Edit modal's own Cancel action — see
+// EDIT_ACTION_STATUS in app/utils/statusGroups.js) rather than introducing a second,
+// differently spelled status.
+const CANCEL_OR_TERMINATE_STATUS = { Cancel: 'Cancelled', Terminate: 'Terminated' };
 
 async function cancelOrTerminateLegalRequest(id, body, action) {
   if (!body.comment || !body.comment.trim()) throw new ApiError(400, 'Comment is required.');
@@ -117,11 +118,14 @@ async function cancelOrTerminateLegalRequest(id, body, action) {
 
   return sequelize.transaction(async transaction => {
     const options = { transaction };
-    await lockRequest(id, options);
+    const existing = await lockRequest(id, options);
 
     await updateEditableFields(id, body, status, options);
 
-    await insertComment(id, body.comment, body.updatedName, LEGAL_COMMENT_ROLE, body.emId, options);
+    // Displayed commenter identity is the job's own Requestor, not the legal user who
+    // clicked Cancel/Terminate — the action itself (who performed it, updated_by/
+    // contract_legal_history) still records the acting legal user unchanged.
+    await insertComment(id, body.comment, existing.requestorName, LEGAL_COMMENT_ROLE, existing.createdBy, options);
 
     await insertLegalHistory(id, action, body.updatedName, body.emId, options);
 

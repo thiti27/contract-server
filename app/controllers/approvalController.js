@@ -57,6 +57,15 @@ function computeApprovalCommentRole(existing, actorEmId) {
   return 'Others';
 }
 
+// Cancel's own "Information" is just its Reason (ActionInfoSection's Cancel-specific
+// layout — see schema.sql's comment above cancel_reason) filled in when the linked
+// Cancel request was created. Folded into a real comment when that request finishes
+// approval (reaches Drafted, i.e. the cancellation itself completes) so it shows up in
+// the ORIGINAL contract's Comment History, not only on the Cancel request's own row.
+function buildCancelReasonComment(body) {
+  return body.cancelReason ? `Reason: ${body.cancelReason}` : null;
+}
+
 // "Approved By" Signature format: first name + first 2 letters of the last name,
 // e.g. "Thitinun" + "Chaychayanon" -> "Thitinun Ch." — captured from the acting
 // approver's own session at approval time so display never needs to join back to
@@ -81,10 +90,18 @@ async function insertApprovalHistory(id, action, emId, name, options = {}) {
 // whether this call created the counter row or incremented an existing one — MySQL only
 // populates the session's last-insert-id from the ON DUPLICATE KEY branch's expression
 // unless the plain INSERT path also routes its value through LAST_INSERT_ID().
-async function generateContractNo(referContractNo, options) {
+//
+// Branches on `remark` explicitly (not on whether referContractNo happens to be set) —
+// contract_no_sequences (the base "DSSTNN-YYYY" counter) must only ever be incremented
+// for an actual new master contract (remark === 'new'). Every other remark (Renew/Amend/
+// Claim Note/Terminate) always numbers itself off contract_revision_sequences, keyed by
+// the base contract it refers to, regardless of what referContractNo happens to contain —
+// so a bug or stray value there can never accidentally consume a base sequence number.
+async function generateContractNo(remark, referContractNo, options) {
   const pad = n => String(n).padStart(2, '0');
 
-  if (referContractNo) {
+  if (remark !== 'new') {
+    if (!referContractNo) throw new ApiError(400, 'Refer to Contract No. is required to generate a revision number.');
     await exec(
       `INSERT INTO contract_revision_sequences (contract_no, last_revision) VALUES (:ref, LAST_INSERT_ID(1))
        ON DUPLICATE KEY UPDATE last_revision = LAST_INSERT_ID(last_revision + 1)`,
@@ -120,7 +137,8 @@ async function generateContractNo(referContractNo, options) {
 // `lockRequestForUpdate(id, { columns, requireStatus }, options)` helper instead.
 async function lockRequest(id, options) {
   const rows = await select(
-    `SELECT status, created_by, refer_contract_no, approver1_em_id, approver2_em_id, approver3_em_id
+    `SELECT status, created_by, refer_contract_no, linked_master_id, remark, requestor_name,
+            approver1_em_id, approver2_em_id, approver3_em_id
      FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
     { id },
     options
@@ -136,6 +154,11 @@ async function approveRequest(id, body) {
 
     const nextStatus = resolveNextStatus(existing);
     if (!nextStatus) throw new ApiError(400, `Cannot approve a request with status "${existing.status}".`);
+    // True only for the specific approve call that completes a Cancel request's own
+    // approval chain (Approver 3, Waiting Approver 3 -> Drafted) — Approver 1/2's
+    // earlier approve calls on the same Cancel request are NOT this, since the request
+    // hasn't actually cancelled anything yet at those stages.
+    const isCancelCompletion = nextStatus === 'Drafted' && existing.remark === 'cancel' && !!existing.linked_master_id;
 
     await updateEditableFields(id, body, nextStatus, options);
 
@@ -154,12 +177,61 @@ async function approveRequest(id, body) {
       await insertComment(id, body.comment, body.updatedName, role, body.emId, options);
     }
 
-    await insertApprovalHistory(id, 'Approve', body.emId, body.updatedName, options);
+    // Normally this action's own approval history stays on the request itself — but a
+    // Cancel request's completion is the one exception: it references the ORIGINAL
+    // contract it just cancelled instead, so that contract's own audit trail shows this
+    // approval, not the (now-closed) cancel request's history, which nothing looks at
+    // again once it's done its job.
+    await insertApprovalHistory(isCancelCompletion ? existing.linked_master_id : id, 'Approve', body.emId, body.updatedName, options);
 
     let contractNo = null;
-    if (nextStatus === 'Drafted') {
+    if (isCancelCompletion) {
+      // A Cancel request (More menu > Cancel on a Drafted row) finishing its own approval
+      // chain is what actually cancels the *original* contract — its master stays
+      // completely untouched (still 'Drafted', never 'Waiting Approver N') for the entire
+      // time this Cancel request works through its own separate approval chain. Unlike
+      // Renew/Amend/Claim Note/Terminate, a Cancel request was never meant to become a
+      // contract in its own right — it's only a vehicle for getting the cancellation
+      // approved — so it doesn't mint its own contract_no. It DOES stay a permanent row
+      // now, though (never soft-deleted): its own status flips to 'Cancelled' — same as
+      // the master — so it remains a searchable audit-trail entry in My History
+      // (HISTORY_STATUSES) instead of disappearing the moment approval completes.
+      const infoComment = buildCancelReasonComment(body);
+      if (infoComment) {
+        // Commenter is the Cancel request's own Requestor (its requestor_name/created_by
+        // — the person who actually filled in this Reason and asked for the
+        // cancellation), never whichever approver happens to be the one clicking this
+        // final approve — even though Approver 3 is who triggers this.
+        await insertComment(
+          existing.linked_master_id,
+          infoComment,
+          existing.requestor_name,
+          'Requester',
+          existing.created_by,
+          options
+        );
+      }
+
+      await exec(
+        `UPDATE contract_requests SET status = 'Cancelled', updated_at = NOW() WHERE id = :masterId AND deleted_at IS NULL`,
+        { masterId: existing.linked_master_id },
+        options
+      );
+
+      // This request's own record — kept permanently (unlike the old soft-delete-on-
+      // completion behavior) as the audit trail for the cancellation, so its own comment
+      // thread (creator's note, any approver remarks) stays intact and reachable through
+      // its own id rather than being re-parented onto the master.
+      await exec(`UPDATE contract_requests SET status = 'Cancelled', updated_at = NOW() WHERE id = :id`, { id }, options);
+    } else if (nextStatus === 'Drafted') {
+      // Renew/Amend/Claim Note/Terminate: unlike Cancel above, this request's own
+      // Background/Detail/Attached files ("___ Information") is never folded into a
+      // comment here — it already persists on the row itself (action_background/
+      // action_detail/action files), readable directly via its own "___ Information"
+      // section, so there's no need to duplicate it into Comment History. Only
+      // Approver 3's own typed comment (handled earlier, above) gets saved.
       const referContractNo = (body.referContractNo || '').trim() || null;
-      contractNo = await generateContractNo(referContractNo, options);
+      contractNo = await generateContractNo(existing.remark, referContractNo, options);
       await exec(`UPDATE contract_requests SET contract_no = :contractNo WHERE id = :id`, { id, contractNo }, options);
     }
 

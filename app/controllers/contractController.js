@@ -19,7 +19,6 @@ export async function listContracts(req, res) {
     createdBy = '',
     approverEmId = '',
     legalCheck = '',
-    noNeededEmId = '',
     page = '1',
     pageSize = '10',
   } = req.query;
@@ -79,20 +78,10 @@ export async function listContracts(req, res) {
   const statusList = statuses ? statuses.split(',').filter(Boolean) : [];
   if (statusList.length) {
     const placeholders = statusList.map((_, i) => `:status${i}`).join(', ');
-    let statusClause = `c.status IN (${placeholders})`;
+    clauses.push(`c.status IN (${placeholders})`);
     statusList.forEach((s, i) => {
       replacements[`status${i}`] = s;
     });
-    // Job Status > My History's scope (statusList = HISTORY_STATUSES) never included
-    // 'No Needed' — legal marking a request "No Need" ends its lifecycle without
-    // going through any of those statuses. OR-ing it in here (rather than adding it to
-    // statusList) keeps it scoped to rows the current user created, unlike every other
-    // status in this list which is shown regardless of who created the row.
-    if (noNeededEmId) {
-      statusClause = `(${statusClause} OR (c.status = 'No Needed' AND c.created_by = :noNeededEmId))`;
-      replacements.noNeededEmId = noNeededEmId;
-    }
-    clauses.push(statusClause);
   }
 
   const where = clauses.join(' AND ');
@@ -107,15 +96,40 @@ export async function listContracts(req, res) {
               c.remark, ct.name AS type, c.contract_purpose AS purpose,
               c.requestor_section AS section, c.contract_year AS year, c.expire_date AS expireDate, c.status,
               c.confidentiality, c.created_by AS createdBy,
+              -- Exposed so the client can determine "is this viewer one of this job's 3
+              -- approvers" directly from the job's own data (see ContractTable.jsx's
+              -- confidentiality access check on All Job/Home) — not sensitive, em_ids are
+              -- already visible elsewhere in this app (signatures, comments, ...).
+              c.approver1_em_id AS approver1EmId, c.approver2_em_id AS approver2EmId, c.approver3_em_id AS approver3EmId,
+              -- Exposed so the Legal Comment row action (My Job/Contract Making/Upload
+              -- Contract/All Job/Home) can hide itself once legal_check = 1, same
+              -- condition Legal > Waiting's own scope already uses server-side.
+              c.legal_check AS legalCheck,
               c.updated_by AS updatedBy, c.updated_name AS updatedName, c.updated_at AS updatedAt
        FROM contract_requests c
        LEFT JOIN contract_types ct ON ct.id = c.contract_type_id
        WHERE ${where}
        -- Grouped display (Company -> master contract -> renew/amend/claim/terminate children,
-       -- see ContractTable.jsx) needs same-company/same-master rows contiguous, so this sorts by
-       -- supplier, then by the master contract_no (a child's refer_contract_no points back to it),
-       -- then by id so the master (lowest id in its group) leads its own children.
-       ORDER BY c.supplier_name ASC, COALESCE(NULLIF(c.refer_contract_no, ''), c.contract_no) ASC, c.id ASC
+       -- see ContractTable.jsx) needs same-company/same-master rows contiguous AND in
+       -- revision order (base, then -01, -02, ...), so this sorts by: supplier, then the
+       -- master contract_no (a child's refer_contract_no points back to it, grouping the
+       -- family together), then the master itself first within that group, then each
+       -- child by its own revision number — NOT by id/creation order, since a later-
+       -- created child can finish approval (and so get numbered) before an earlier one,
+       -- which would otherwise show "-02" above "-01".
+       ORDER BY
+         c.supplier_name ASC,
+         COALESCE(NULLIF(c.refer_contract_no, ''), c.contract_no) ASC,
+         (c.refer_contract_no IS NULL OR c.refer_contract_no = '') DESC,
+         -- A pending Amend/Renew/Terminate/Claim Note still shows its Reference Item's
+         -- own contract_no as a placeholder (see requestController.js's createRequest)
+         -- until Approver 3 mints its real "-NN" suffix — without this, a still-pending
+         -- child (contract_no identical to the group's own base number) would sort by
+         -- the base year instead of a revision number, landing it above/among already-
+         -- numbered siblings instead of after them.
+         (c.refer_contract_no IS NOT NULL AND c.refer_contract_no <> '' AND c.contract_no = c.refer_contract_no) ASC,
+         CAST(SUBSTRING_INDEX(c.contract_no, '-', -1) AS UNSIGNED) ASC,
+         c.id ASC
        LIMIT ${size} OFFSET ${offset}`,
       replacements
     ),

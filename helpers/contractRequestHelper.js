@@ -15,6 +15,49 @@ export const DOCUMENT_TYPE_KEYS = {
   other: 'other',
 };
 
+// Strips a revision suffix (e.g. "DSST01-2026-01" -> "DSST01-2026") so refer_contract_no
+// always points at the base contract, never at one specific revision of it. Applied
+// defensively here (not just client-side — see normalizeReferContractNo in
+// contravct-web/src/lib/contractNo.js) because approvalController.js's
+// generateContractNo keys the contract_revision_sequences counter off this value
+// directly: a revisioned referContractNo would nest revisions ("DSST01-2026-01-01")
+// instead of continuing the same counter for the base contract ("DSST01-2026-02").
+export function normalizeReferContractNo(contractNo) {
+  const match = /^(DSST\d+-\d{4})-\d{2}$/.exec(contractNo || '');
+  return match ? match[1] : contractNo || null;
+}
+
+// Server-side re-check backing the same rule the frontend uses to decide whether to
+// grey out View/Download for a HIGH CONFIDENTIAL row on All Job/Home (see
+// ContractTable.jsx) — the frontend gate is only a UI convenience, this is what
+// actually stops a non-permitted user reading a confidential contract's detail or
+// downloading one of its attached files by calling the API directly.
+//
+// This same check also guards getRequest(), which every mode (Edit, Approve, Legal
+// Review, View) fetches a contract's detail through — so on top of the 3 conditions
+// All Job/Home surface in the UI (creator, `view` permission, one of the 3 approvers),
+// `legal`/`admin` are also let through here: Waiting Approve/Waiting Check/Legal
+// History's own View button has never been confidentiality-gated (approvalMode's
+// RowActions branch in ContractTable.jsx ignores `restricted` entirely, since being in
+// that queue already means you're supposed to review the row) — omitting them here
+// would silently break legal review / approval for confidential contracts instead of
+// just tightening what All Job/Home already restrict.
+//
+// A non-confidential row is always accessible. approver slots that are null/undefined/
+// empty never count as a match, and em_ids are compared as strings so a numeric vs
+// string mismatch can't accidentally deny (or allow) access.
+export function hasConfidentialAccess(row, user) {
+  if (!row?.confidentiality) return true;
+  if (user?.legal || user?.admin) return true;
+  const emId = user?.em_id != null ? String(user.em_id) : '';
+  if (!emId) return false;
+  if (String(row.created_by ?? '') === emId) return true;
+  if (user?.view) return true;
+  return [row.approver1_em_id, row.approver2_em_id, row.approver3_em_id].some(
+    a => a != null && String(a) !== '' && String(a) === emId
+  );
+}
+
 // Updates every editable field on a contract_requests row. `status` is passed in
 // (rather than read from `body`) because callers compute it themselves from their
 // own workflow rules — this function never decides a status transition, it only
@@ -22,6 +65,12 @@ export const DOCUMENT_TYPE_KEYS = {
 export async function updateEditableFields(id, body, status, options = {}) {
   const approvers = body.approvers || [];
   const payments = body.payments || {};
+  const remark = body.remark || 'new';
+  // Cancel keeps whatever exact contract_no it was created against, unnormalized — see
+  // requestController.js's createRequest for why. linked_master_id is likewise just
+  // trusted as sent, same reasoning.
+  const referContractNo = remark === 'cancel' ? (body.referContractNo || null) : normalizeReferContractNo(body.referContractNo);
+  const linkedMasterId = body.linkedMasterId || null;
 
   await exec(
     `UPDATE contract_requests SET
@@ -29,7 +78,11 @@ export async function updateEditableFields(id, body, status, options = {}) {
        contract_purpose = :contractPurpose, other_specify = :otherSpecify, supplier_name = :supplierName,
        contract_year = YEAR(:requestDate), request_date = :requestDate, delivery_date = :deliveryDate,
        location = :location, warranty_period = :warrantyPeriod, refer_contract_no = :referContractNo,
-       brief_description = :briefDescription, total_net_price = :totalNetPrice, vat = :vat,
+       linked_master_id = :linkedMasterId,
+       brief_description = :briefDescription, action_background = :actionBackground, action_detail = :actionDetail,
+       new_contract_start_date = :newContractStartDate, new_contract_end_date = :newContractEndDate,
+       action_effective_date = :actionEffectiveDate, cancel_reason = :cancelReason,
+       total_net_price = :totalNetPrice, vat = :vat,
        currency = :currency, trade_term = :tradeTerm, payment_other = :paymentOther,
        payment1 = :payment1, payment2 = :payment2, payment3 = :payment3, payment4 = :payment4,
        payment5 = :payment5, payment6 = :payment6, payment7 = :payment7, payment8 = :payment8,
@@ -49,8 +102,15 @@ export async function updateEditableFields(id, body, status, options = {}) {
       deliveryDate: body.deliveryDate || null,
       location: body.location || null,
       warrantyPeriod: body.warrantyPeriod || null,
-      referContractNo: body.referContractNo || null,
+      referContractNo,
+      linkedMasterId,
       briefDescription: body.briefDescription || null,
+      actionBackground: body.actionBackground || null,
+      actionDetail: body.actionDetail || null,
+      newContractStartDate: body.newContractStartDate || null,
+      newContractEndDate: body.newContractEndDate || null,
+      actionEffectiveDate: body.actionEffectiveDate || null,
+      cancelReason: body.cancelReason || null,
       totalNetPrice: body.totalNetPrice || null,
       vat: body.vat || null,
       currency: body.currency || null,
@@ -66,7 +126,7 @@ export async function updateEditableFields(id, body, status, options = {}) {
       payment8: payments.payment8 || null,
       requestorName: body.requestorName || '',
       requestorSection: body.requestorSection || '',
-      remark: body.remark || 'new',
+      remark,
       // approvers[] is UI row order top-to-bottom (Manager, Supervisor, Supervisor), but
       // the approval sequence runs bottom-up (index 2 approves first as Approver 1, index
       // 0/Manager signs off last as Approver 3) — see the comment above ApprovalSection's
@@ -81,6 +141,7 @@ export async function updateEditableFields(id, body, status, options = {}) {
   );
 
   await upsertDocuments(id, body.documents, body.emId, options);
+  await upsertActionFiles(id, body.actionFiles, body.emId, options);
 }
 
 // Upserts the document checklist + attached-file links for one request. Used both
@@ -131,6 +192,31 @@ export async function upsertDocuments(id, documents, emId, options = {}) {
         options
       );
     }
+  }
+}
+
+// Append-only file attachments for one request's "___ Information" section — same idiom
+// as upsertDocuments above, minus the per-type checklist row since these files aren't
+// categorized, just a flat list (see contract_request_action_files in schema.sql).
+// Removing a file is handled client-side by soft-deleting the file_uploads row directly
+// (same as Related Contract Document's removeFile) rather than deactivating the link —
+// the join in requestController.getRequest already filters on file_uploads.active.
+export async function upsertActionFiles(id, files, emId, options = {}) {
+  const linked = await select(
+    `SELECT file_upload_id AS fileUploadId FROM contract_request_action_files
+     WHERE contract_request_id = :id AND active = 1 AND deleted_at IS NULL`,
+    { id },
+    options
+  );
+  const alreadyLinked = new Set(linked.map(r => r.fileUploadId));
+  for (const file of files || []) {
+    if (alreadyLinked.has(file.id)) continue;
+    await exec(
+      `INSERT INTO contract_request_action_files (contract_request_id, file_upload_id, created_by)
+       VALUES (:id, :fileId, :emId)`,
+      { id, fileId: file.id, emId: emId || null },
+      options
+    );
   }
 }
 

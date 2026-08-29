@@ -176,6 +176,119 @@ async function migrateSignedContractColumns() {
   await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN reminder_before_expiry_days SMALLINT AFTER renewal_condition`);
 }
 
+// One-time additive migration for databases created before contract_requests grew
+// action_background/action_detail (ActionInfoSection.jsx's "___ Information" section,
+// shown for Renew/Amend/Claim Note/Terminate requests) — present in schema.sql's CREATE
+// TABLE for fresh databases, same idiom as migrateSignedContractColumns above.
+async function migrateActionInfoColumns() {
+  const tryAddColumn = async sql => {
+    try {
+      await exec(sql);
+    } catch (err) {
+      if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+      throw err;
+    }
+  };
+
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN action_background TEXT AFTER brief_description`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN action_detail TEXT AFTER action_background`);
+}
+
+// One-time additive migration for databases created before contract_requests grew
+// remark-specific detail columns: Renew's own proposed New Period dates, Amend/
+// Terminate's Effective Date, and Cancel's Reason (see ActionInfoSection.jsx's
+// per-remark field layout, and the comment above these columns in schema.sql).
+// action_background/action_detail above are already reused across Renew ("Purpose")/
+// Amend/Terminate/Claim Note with different on-screen labels per remark, but these
+// four have no existing column to repurpose without conflating unrelated concepts.
+async function migrateRemarkDetailColumns() {
+  const tryAddColumn = async sql => {
+    try {
+      await exec(sql);
+    } catch (err) {
+      if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+      throw err;
+    }
+  };
+
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN new_contract_start_date DATE AFTER action_detail`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN new_contract_end_date DATE AFTER new_contract_start_date`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN action_effective_date DATE AFTER new_contract_end_date`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN cancel_reason TEXT AFTER action_effective_date`);
+}
+
+// One-time migration for databases created before 'cancel' was added to contract_requests
+// .remark's allowed values (the More menu's Cancel button on a Drafted row now opens the
+// same linked-request flow as Renew/Amend/Claim Note/Terminate, storing remark = 'cancel').
+// CHECK constraints get an auto-generated name in MySQL (no `CONSTRAINT name` was given in
+// schema.sql), so the name has to be looked up rather than assumed — this finds whichever
+// CHECK constraint on this table enforces the remark enum (by its clause text) and only
+// drops/recreates it if 'cancel' isn't already in that clause, making repeat runs a no-op.
+async function migrateCancelRemark() {
+  const constraints = await select(
+    `SELECT tc.CONSTRAINT_NAME AS name, cc.CHECK_CLAUSE AS clause
+     FROM information_schema.TABLE_CONSTRAINTS tc
+     JOIN information_schema.CHECK_CONSTRAINTS cc
+       ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+     WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = 'contract_requests'
+       AND tc.CONSTRAINT_TYPE = 'CHECK' AND cc.CHECK_CLAUSE LIKE '%remark%'`
+  );
+
+  for (const { name, clause } of constraints) {
+    if (clause.includes('cancel')) continue;
+    await exec(`ALTER TABLE contract_requests DROP CHECK \`${name}\``);
+    await exec(
+      `ALTER TABLE contract_requests ADD CONSTRAINT chk_contract_requests_remark
+       CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel'))`
+    );
+  }
+}
+
+// One-time additive migration for databases created before contract_requests grew
+// linked_master_id (see schema.sql for why this is separate from refer_contract_no).
+async function migrateLinkedMasterIdColumn() {
+  try {
+    await exec(`ALTER TABLE contract_requests ADD COLUMN linked_master_id INT AFTER refer_contract_no`);
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
+// One-time data fix for rows already saved with the old 'Canceled' (single L) status
+// spelling, from before every reference to it (HISTORY_STATUSES, StatusBadge,
+// EDIT_ACTION_STATUS, legalController's Cancel/Terminate action, the Cancel-completion
+// logic in approvalController.js) was renamed to 'Cancelled'. A plain UPDATE, not an
+// ALTER — status has no CHECK constraint restricting its values, so no schema change is
+// needed here, just bringing existing data in line with the new spelling. Naturally
+// idempotent: a rerun finds no 'Canceled' rows left and does nothing.
+async function migrateCancelledSpelling() {
+  await exec(`UPDATE contract_requests SET status = 'Cancelled' WHERE status = 'Canceled'`);
+}
+
+// One-time (and self-healing on every restart) data fix for contract_no_sequences —
+// approvalController.js's generateContractNo now only ever increments this table for
+// remark = 'new', but seeded/imported rows can carry a "DSSTNN-YYYY" contract_no that
+// was never actually minted through that function (see seedContractRequests below,
+// which inserts contract numbers directly), leaving last_number out of sync with what's
+// really in use. Recomputes each year to the true highest base number already claimed
+// by ANY row for that year (not just remark = 'new' — protects against colliding with a
+// pre-existing/seeded number regardless of how it got there), so the next mint is always
+// max+1. Deliberately never INSERTs a new year row — generateContractNo's own
+// INSERT ... ON DUPLICATE KEY already creates one lazily the first time a year is
+// actually used, this only corrects rows that already exist.
+async function reconcileContractNoSequences() {
+  await exec(`
+    UPDATE contract_no_sequences s
+    SET last_number = COALESCE(
+      (SELECT MAX(CAST(SUBSTRING_INDEX(SUBSTRING(cr.contract_no, 5), '-', 1) AS UNSIGNED))
+       FROM contract_requests cr
+       WHERE cr.contract_no LIKE 'DSST%' AND cr.contract_year = s.year),
+      0
+    )
+  `);
+}
+
 async function seedEmployees() {
   if ((await countRows('employees')) > 0) return;
 
@@ -350,9 +463,18 @@ export async function initDatabase() {
   await migrateLegalCheckColumn();
   await migrateGlobalDocumentColumns();
   await migrateSignedContractColumns();
+  await migrateActionInfoColumns();
+  await migrateRemarkDetailColumns();
+  await migrateCancelRemark();
+  await migrateLinkedMasterIdColumn();
+  await migrateCancelledSpelling();
   await seedEmployees();
   await seedAdminUsers();
   await seedAppUsers();
   await seedContractTypes();
   await seedContractRequests();
+  // Runs after seeding — reconciles contract_no_sequences against whatever contract
+  // numbers actually exist (including the ones seedContractRequests just inserted
+  // directly), so it must come last.
+  await reconcileContractNoSequences();
 }

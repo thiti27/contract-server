@@ -194,7 +194,40 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   location            VARCHAR(300),
   warranty_period     VARCHAR(100),
   refer_contract_no   VARCHAR(100),
+  -- The exact row (by id, not by contract_no string) this Renew/Amend/Claim Note/
+  -- Terminate/Cancel request was created from — kept separate from refer_contract_no
+  -- above (which is normalized to the base contract number, e.g. "DSST01-2026", for the
+  -- revision counter) so a Cancel request that completes approval can find and update
+  -- the SPECIFIC row that was actually canceled, even when that row is itself already a
+  -- revision (e.g. "DSST01-2026-01") rather than the original base. No FK constraint —
+  -- same reasoning as this schema's other cross-references, kept as a plain id.
+  linked_master_id    INT,
   brief_description   TEXT,
+
+  -- "___ Information" section shown only for a Renew/Amend/Claim Note/Terminate/Cancel
+  -- request (remark != 'new') — see ActionInfoSection.jsx (contravct-web). Which of these
+  -- columns is actually used, and what it's labeled on screen, depends on `remark`:
+  --   renew:     action_background = "Purpose"; new_contract_start_date/new_contract_end_date
+  --              = the requested new period. "Original Period" is never stored here — it's
+  --              read fresh from the referenced contract (linked_master_id) at GET time, so
+  --              it can never drift from that contract's own signed period.
+  --   amend:     action_background = "Brief Description & Background/Reason",
+  --              action_detail = "Amended Detail", action_effective_date = "Effective Date".
+  --   terminate: same 3 columns as amend, action_detail just labeled "Terminate Detail" on
+  --              screen instead — same underlying data shape, no separate column needed.
+  --   claim:     action_background = "Brief Description & Background/Reason",
+  --              action_detail = "Claim Detail". No effective date.
+  --   cancel:    cancel_reason only — a plain "Reason" textarea, unrelated to the 3 columns
+  --              above (kept separate rather than reusing action_background, since Cancel's
+  --              shape has no Background/Detail/attachments at all, per its own field list).
+  -- Attached files (amend/terminate/claim only) live in contract_request_action_files below,
+  -- the same way Related Contract Document's files do.
+  action_background       TEXT,
+  action_detail           TEXT,
+  new_contract_start_date DATE,
+  new_contract_end_date   DATE,
+  action_effective_date   DATE,
+  cancel_reason           TEXT,
 
   total_net_price     DECIMAL(14, 2),
   vat                 VARCHAR(20),          -- free text, e.g. "7%"
@@ -213,7 +246,7 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   requestor_name      VARCHAR(300) NOT NULL,
   requestor_section   VARCHAR(150) NOT NULL,
   remark              VARCHAR(20) NOT NULL DEFAULT 'new'
-                        CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate')),
+                        CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel')),
 
   -- 3 signature slots: Manager (required), Supervisor #1 (required), Supervisor #2
   -- (optional). Each stores employees.em_id directly, not the surrogate id — and not
@@ -385,6 +418,25 @@ CREATE TABLE IF NOT EXISTS contract_request_document_files (
 );
 
 CREATE INDEX idx_crdf_document ON contract_request_document_files (contract_request_document_id);
+
+-- Flat file attachments for the "___ Information" section (action_background/
+-- action_detail above) — unlike contract_request_document_files there's no per-type
+-- checklist row to hang off of, just a straight list of files on the request itself.
+CREATE TABLE IF NOT EXISTS contract_request_action_files (
+  id                    INT AUTO_INCREMENT PRIMARY KEY,
+  contract_request_id   INT NOT NULL,
+  file_upload_id        INT NOT NULL,
+  active                TINYINT(1) NOT NULL DEFAULT 1,
+
+  created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at            DATETIME,
+  deleted_at            DATETIME,
+  created_by            VARCHAR(6),
+  updated_by            VARCHAR(6),
+  deleted_by            VARCHAR(6)
+);
+
+CREATE INDEX idx_craf_request ON contract_request_action_files (contract_request_id);
 
 
 -- =========================================================================
