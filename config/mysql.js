@@ -224,15 +224,29 @@ async function migrateRemarkDetailColumns() {
 // schema.sql), so the name has to be looked up rather than assumed — this finds whichever
 // CHECK constraint on this table enforces the remark enum (by its clause text) and only
 // drops/recreates it if 'cancel' isn't already in that clause, making repeat runs a no-op.
+// information_schema.CHECK_CONSTRAINTS only exists on MySQL 8.0.16+ (CHECK constraint
+// support) — on older servers (e.g. MySQL 5.7, still in use in production here) the
+// CHECK(...) clauses in schema.sql are parsed but silently never enforced, so there's
+// no constraint to look up or migrate; ER_UNKNOWN_TABLE just means "nothing to do".
+async function selectCheckConstraints(table, clauseLike) {
+  try {
+    return await select(
+      `SELECT tc.CONSTRAINT_NAME AS name, cc.CHECK_CLAUSE AS clause
+       FROM information_schema.TABLE_CONSTRAINTS tc
+       JOIN information_schema.CHECK_CONSTRAINTS cc
+         ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+       WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = :table
+         AND tc.CONSTRAINT_TYPE = 'CHECK' AND cc.CHECK_CLAUSE LIKE :clauseLike`,
+      { table, clauseLike }
+    );
+  } catch (err) {
+    if (err.original?.code === 'ER_UNKNOWN_TABLE') return [];
+    throw err;
+  }
+}
+
 async function migrateCancelRemark() {
-  const constraints = await select(
-    `SELECT tc.CONSTRAINT_NAME AS name, cc.CHECK_CLAUSE AS clause
-     FROM information_schema.TABLE_CONSTRAINTS tc
-     JOIN information_schema.CHECK_CONSTRAINTS cc
-       ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-     WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.TABLE_NAME = 'contract_requests'
-       AND tc.CONSTRAINT_TYPE = 'CHECK' AND cc.CHECK_CLAUSE LIKE '%remark%'`
-  );
+  const constraints = await selectCheckConstraints('contract_requests', '%remark%');
 
   for (const { name, clause } of constraints) {
     if (clause.includes('cancel')) continue;
@@ -241,6 +255,53 @@ async function migrateCancelRemark() {
       `ALTER TABLE contract_requests ADD CONSTRAINT chk_contract_requests_remark
        CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel'))`
     );
+  }
+}
+
+// One-time migration for databases created before 'waived' was added to
+// contract_requests.remark's allowed values — approvalController.waiveRequest and
+// legalController.waiveLegalRequest now overwrite remark to 'waived' on the row they
+// act on (regardless of what it was before), so the Remark checklist/badge/PDF all
+// have a real value to check against. Same lookup-by-clause-text approach as
+// migrateCancelRemark above (and must run after it, so the recreated clause here
+// already includes 'cancel').
+async function migrateWaivedRemark() {
+  const constraints = await selectCheckConstraints('contract_requests', '%remark%');
+
+  for (const { name, clause } of constraints) {
+    if (clause.includes('waived')) continue;
+    await exec(`ALTER TABLE contract_requests DROP CHECK \`${name}\``);
+    await exec(
+      `ALTER TABLE contract_requests ADD CONSTRAINT chk_contract_requests_remark
+       CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel', 'waived'))`
+    );
+  }
+}
+
+// One-time migration for databases created before 'Waive' replaced legalController's
+// old "No Need" action (Legal > Waiting, and now also Approval > Waiting) — both
+// history tables' `action` CHECK constraint need 'Waive' added to their allowed
+// values. Same lookup-by-clause-text approach as migrateCancelRemark above, since
+// these CHECK constraints also have MySQL-generated names. Existing 'No Need' rows
+// in contract_legal_history are left untouched (that value stays in the constraint
+// too) — this only makes 'Waive' insertable going forward, it doesn't rewrite history.
+async function migrateWaiveAction(table) {
+  const constraints = await selectCheckConstraints(table, '%action%');
+
+  for (const { name, clause } of constraints) {
+    if (clause.includes('Waive')) continue;
+    await exec(`ALTER TABLE ${table} DROP CHECK \`${name}\``);
+    if (table === 'contract_legal_history') {
+      await exec(
+        `ALTER TABLE contract_legal_history ADD CONSTRAINT chk_contract_legal_history_action
+         CHECK (action IN ('Check', 'Terminate', 'No Need', 'Cancel', 'Waive'))`
+      );
+    } else {
+      await exec(
+        `ALTER TABLE contract_approval_history ADD CONSTRAINT chk_contract_approval_history_action
+         CHECK (action IN ('Approve', 'Return', 'Reject', 'Waive'))`
+      );
+    }
   }
 }
 
@@ -253,6 +314,18 @@ async function migrateLinkedMasterIdColumn() {
     if (err.original?.code === 'ER_DUP_FIELDNAME') return;
     throw err;
   }
+}
+
+// One-time migration widening admin_users' created_by/updated_by/deleted_by from
+// VARCHAR(6) (the em_id-sized default every other table's audit columns use) to
+// VARCHAR(150) — Settings > Role Management (roleController.js) stores the acting
+// user's real display name here, not an em_id, so the original width would silently
+// truncate (or error, depending on sql_mode) every audit write. MODIFY COLUMN is
+// naturally idempotent — re-running this against an already-widened column is a no-op.
+async function migrateAdminUsersAuditColumns() {
+  await exec(`ALTER TABLE admin_users MODIFY COLUMN created_by VARCHAR(150)`);
+  await exec(`ALTER TABLE admin_users MODIFY COLUMN updated_by VARCHAR(150)`);
+  await exec(`ALTER TABLE admin_users MODIFY COLUMN deleted_by VARCHAR(150)`);
 }
 
 // One-time data fix for rows already saved with the old 'Canceled' (single L) status
@@ -466,7 +539,11 @@ export async function initDatabase() {
   await migrateActionInfoColumns();
   await migrateRemarkDetailColumns();
   await migrateCancelRemark();
+  await migrateWaivedRemark();
+  await migrateWaiveAction('contract_legal_history');
+  await migrateWaiveAction('contract_approval_history');
   await migrateLinkedMasterIdColumn();
+  await migrateAdminUsersAuditColumns();
   await migrateCancelledSpelling();
   await seedEmployees();
   await seedAdminUsers();

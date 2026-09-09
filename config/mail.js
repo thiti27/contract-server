@@ -1,6 +1,18 @@
-// Placeholder — this project does not send email today (no mail library in
-// package.json, no notification/reminder code anywhere in the app). Kept as an empty
-// stub so the project's standard config/ layout is complete; configure a transport
-// (e.g. nodemailer) here if/when a future job (see app/jobs/) needs to send mail.
-// Nothing currently imports this file.
-export default {};
+import nodemailer from 'nodemailer';
+import config from './config.js';
+
+// Single transporter instance, created once at module load — every caller (see
+// services/contractEmail.service.js) imports and reuses this exact object instead of
+// calling createTransport() per send. Host/port are env-overridable (see
+// config/config.js's `email` block); secure/tls are fixed transport settings, not
+// per-environment config, per the SMTP server's own requirements.
+const transporter = nodemailer.createTransport({
+  host: config.email.host,
+  port: config.email.port,
+  secure: false,
+  tls: {
+    rejectUnauthorized: false,
+  },
+});
+
+export default transporter;

@@ -8,6 +8,7 @@ import {
   insertComment,
   normalizeReferContractNo,
   hasConfidentialAccess,
+  notifyApproverForContractRequest,
 } from '../../helpers/contractRequestHelper.js';
 import { NEW_REQUEST_STATUS, EDIT_ACTION_STATUS } from '../utils/statusGroups.js';
 import { toDateOnly } from '../utils/dateUtils.js';
@@ -30,6 +31,20 @@ const REFER_CONTRACT_NO_PLACEHOLDER_REMARKS = ['amend', 'renew', 'terminate', 'c
 // New contract requests (draft or sent) from the New Request form
 // ---------------------------------------------------------------------------
 export async function createRequest(req, res) {
+  try {
+    await createRequestBody(req, res);
+  } catch (err) {
+    handleApprovalError(err, res);
+  }
+}
+
+// Everything below is unchanged from before — same sequential awaits (no transaction
+// wrapper added, none existed before), same status/request-type mapping, same email
+// notification call — only wrapped in the try/catch above now, same pattern
+// approve/waive/reject/updateRequest already use (see this same file's updateRequest,
+// or approvalController.js) instead of leaving this route as the one handler in the
+// project with no error handling at all.
+async function createRequestBody(req, res) {
   const body = req.body || {};
   const status = NEW_REQUEST_STATUS[body.status] || 'Saved';
   const approvers = body.approvers || [];
@@ -134,6 +149,20 @@ export async function createRequest(req, res) {
   await upsertDocuments(requestId, body.documents, body.emId);
   await upsertActionFiles(requestId, body.actionFiles, body.emId);
 
+  // Send Request (not Save Draft) notifies Approver 1 — approvers[2] is the bottom
+  // Supervisor slot, always required (see formConfig.js's approverErrors), which is
+  // exactly what approver1_em_id was just inserted as above.
+  if (status === 'Waiting Approver 1') {
+    await notifyApproverForContractRequest(approvers[2], {
+      body,
+      remark,
+      contractNo,
+      requestorName: body.requestorName,
+      linkedMasterId,
+      systemUrl: body.systemUrl,
+    });
+  }
+
   res.status(201).json({ id: requestId, status });
 }
 
@@ -192,6 +221,19 @@ export async function getRequest(req, res) {
      ORDER BY created_at ASC`,
     { id }
   );
+
+  // The actual signed contract PDF attached via Upload Sign Contract — separate from
+  // the system-generated Contract Requisition Form PDF (client-rendered, never stored).
+  // Only present once status has reached Signed (or Terminated, which only ever gets
+  // there via a Signed Terminate request's cascade — see signedContractController.js).
+  let signedFile = null;
+  if (row.signed_file_id) {
+    const signedFileRows = await select(
+      `SELECT id, file_name AS fileName, extension FROM file_uploads WHERE id = :fileId AND active = 1 AND deleted_at IS NULL`,
+      { fileId: row.signed_file_id }
+    );
+    signedFile = signedFileRows[0] || null;
+  }
 
   const actionFileRows = await select(
     `SELECT f.id, f.file_name AS fileName, f.extension
@@ -258,6 +300,7 @@ export async function getRequest(req, res) {
       { name: row.approver1_name || '', approvedAt: toDateOnly(row.approver1_approved_at) },
     ],
     remark: row.remark || 'new',
+    signedFile,
   });
 }
 
@@ -265,6 +308,16 @@ export async function getRequest(req, res) {
 // the resulting status transition (server-side, never trusting a client-supplied
 // status directly). `save-change` intentionally keeps whatever status the row is
 // already at — editing an in-flight request doesn't restart its approval stage.
+// Which approverN_em_id column is "the current stage" for a given status — same
+// mapping approvalController.js's own STAGE_COLUMN uses, kept as an independent local
+// copy rather than importing across controllers (matches this codebase's existing
+// controller-to-controller isolation).
+const EDIT_STAGE_COLUMN = {
+  'Waiting Approver 1': 'approver1_em_id',
+  'Waiting Approver 2': 'approver2_em_id',
+  'Waiting Approver 3': 'approver3_em_id',
+};
+
 export async function updateRequest(req, res) {
   const { id } = req.params;
   const body = req.body || {};
@@ -273,17 +326,27 @@ export async function updateRequest(req, res) {
     return res.status(400).json({ message: 'Invalid action.' });
   }
 
+  // Captured inside the transaction below, read again after it commits — same
+  // "notify only after the DB change has actually persisted" reasoning
+  // approvalController.js's approveRequest already uses.
+  let existingForEmail = null;
+  let statusForEmail = null;
+
   try {
     const result = await sequelize.transaction(async transaction => {
       const options = { transaction };
       const existing = await select(
-        `SELECT status, created_by FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
+        `SELECT status, created_by, contract_no, refer_contract_no, linked_master_id, remark,
+                approver1_em_id, approver2_em_id, approver3_em_id
+         FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
         { id },
         options
       );
       if (!existing.length) throw new ApiError(404, 'Contract request not found');
+      existingForEmail = existing[0];
 
       const status = EDIT_ACTION_STATUS[action] || existing[0].status;
+      statusForEmail = status;
 
       await updateEditableFields(id, body, status, options);
 
@@ -294,6 +357,36 @@ export async function updateRequest(req, res) {
 
       return { id: Number(id), status };
     });
+
+    // Edit + Save only re-notifies when it actually reassigns the approver for the
+    // request's CURRENT stage — not on every save (that would re-spam the same
+    // approver every time a typo gets fixed), and not on Save Draft/Cancel/Send
+    // Request (send-request's own notification already happens in createRequest;
+    // there's no "current stage" yet on a still-Saved draft). approvers[] is UI row
+    // order top-to-bottom (Manager, Supervisor, Supervisor) — approvers[2]/[1]/[0] map
+    // to approver1/2/3 respectively, same mapping updateEditableFields itself uses.
+    const stageColumn = EDIT_STAGE_COLUMN[statusForEmail];
+    if (stageColumn && existingForEmail) {
+      const approvers = body.approvers || [];
+      const newEmIdByColumn = {
+        approver1_em_id: approvers[2] || null,
+        approver2_em_id: approvers[1] || null,
+        approver3_em_id: approvers[0] || null,
+      };
+      const newEmId = newEmIdByColumn[stageColumn];
+      const oldEmId = existingForEmail[stageColumn];
+      if (newEmId && newEmId !== oldEmId) {
+        await notifyApproverForContractRequest(newEmId, {
+          body,
+          remark: existingForEmail.remark,
+          contractNo: existingForEmail.contract_no,
+          requestorName: body.requestorName,
+          linkedMasterId: existingForEmail.linked_master_id,
+          systemUrl: body.systemUrl,
+        });
+      }
+    }
+
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);

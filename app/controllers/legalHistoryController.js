@@ -1,7 +1,7 @@
 import { select } from '../../config/mysql.js';
 
 // ---------------------------------------------------------------------------
-// Legal > History — one row per Check/Terminate/Cancel/No Need action any legal
+// Legal > History — one row per Check/Terminate/Cancel/Waive action any legal
 // user has taken. Unlike Approval > My History, this is NOT filtered by created_by:
 // legal is a shared role queue, so every legal user sees the same combined history.
 // ---------------------------------------------------------------------------

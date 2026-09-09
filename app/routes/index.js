@@ -8,14 +8,13 @@ import contractTypeRoutes from './contractType.routes.js';
 import globalDocumentRoutes from './globalDocument.routes.js';
 import uploadRoutes from './upload.routes.js';
 import requestRoutes from './request.routes.js';
-import contractPdfRoutes from './contractPdf.routes.js';
 import approvalRoutes from './approval.routes.js';
 import approvalHistoryRoutes from './approvalHistory.routes.js';
 import legalRoutes from './legal.routes.js';
 import legalHistoryRoutes from './legalHistory.routes.js';
 import signedContractRoutes from './signedContract.routes.js';
 import formRoutes from './form.routes.js';
-import spaRoutes from './spa.routes.js';
+import roleRoutes from './role.routes.js';
 
 const router = Router();
 
@@ -32,17 +31,12 @@ router.use('/api', authenticate, contractTypeRoutes);
 router.use('/api', authenticate, globalDocumentRoutes);
 router.use('/api', authenticate, uploadRoutes);
 router.use('/api', authenticate, requestRoutes);
-router.use('/api', authenticate, contractPdfRoutes);
 router.use('/api', authenticate, approvalRoutes);
 router.use('/api', authenticate, approvalHistoryRoutes);
 router.use('/api', authenticate, legalRoutes);
 router.use('/api', authenticate, legalHistoryRoutes);
 router.use('/api', authenticate, signedContractRoutes);
 router.use('/api', authenticate, formRoutes);
-
-// SPA fallback must be registered last — same ordering the original server.js used
-// (app.get('*', ...) as the very last route) — so it only ever catches paths no
-// earlier route (API or static) already matched.
-router.use(spaRoutes);
+router.use('/api', authenticate, roleRoutes);
 
 export default router;

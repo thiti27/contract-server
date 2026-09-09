@@ -9,18 +9,37 @@ export async function listContractTypes(_req, res) {
      FROM contract_types WHERE active = 1 AND deleted_at IS NULL ORDER BY id`
   );
   const purposes = await select(
-    `SELECT contract_type_id AS contractTypeId, purpose_text AS purposeText
+    `SELECT id, contract_type_id AS contractTypeId, purpose_text AS purposeText
      FROM contract_type_purposes WHERE active = 1 AND deleted_at IS NULL ORDER BY id`
+  );
+  // ENG/THA template files attached per purpose (see attachFormItem/removeFormItem
+  // below) — kept as a purposeText-keyed side map (purposeDocuments) rather than
+  // folded into `purposes` itself, since `purposes` stays a plain string[] for the
+  // New Request form's dropdown (FormSelect options) exactly as before. Only the
+  // Drafted-status zip download (ContractListPage.jsx's handleDownloadPdf) reads
+  // purposeDocuments.
+  const formItems = await select(
+    `SELECT contract_type_purpose_id AS purposeId, file_eng_path AS fileEngPath, file_tha_path AS fileThaPath
+     FROM form_items WHERE active = 1 AND deleted_at IS NULL`
   );
 
   res.json(
-    types.map(t => ({
-      id: t.id,
-      name: t.name,
-      description: t.description,
-      allowCustomPurpose: !!t.allowCustomPurpose,
-      purposes: purposes.filter(p => p.contractTypeId === t.id).map(p => p.purposeText),
-    }))
+    types.map(t => {
+      const typePurposes = purposes.filter(p => p.contractTypeId === t.id);
+      return {
+        id: t.id,
+        name: t.name,
+        description: t.description,
+        allowCustomPurpose: !!t.allowCustomPurpose,
+        purposes: typePurposes.map(p => p.purposeText),
+        purposeDocuments: Object.fromEntries(
+          typePurposes.map(p => {
+            const item = formItems.find(f => f.purposeId === p.id);
+            return [p.purposeText, { fileEngPath: item?.fileEngPath || null, fileThaPath: item?.fileThaPath || null }];
+          })
+        ),
+      };
+    })
   );
 }
 

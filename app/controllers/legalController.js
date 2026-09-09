@@ -5,7 +5,7 @@ import { handleApprovalError } from '../middleware/errorHandler.js';
 
 // ---------------------------------------------------------------------------
 // Legal Review Mode (Legal > Waiting screen) — Comment / Check / Terminate /
-// No Need / Cancel, each atomic (single Sequelize transaction).
+// Waive / Cancel, each atomic (single Sequelize transaction).
 // ---------------------------------------------------------------------------
 
 // Comments left from Legal Review Mode are always labeled "LG", regardless of which
@@ -78,25 +78,32 @@ async function checkLegalRequest(id, body) {
   });
 }
 
-// No Need marks a contract that legal has determined doesn't require review — a
-// simpler sibling to Check/Terminate: no edited-fields save, no comment, just a
-// contract_legal_history row and a terminal status flip. That status flip is also
-// what drops it off Legal > Waiting (same mechanism as Terminate — neither
-// 'No Needed' nor 'Terminated' is in LEGAL_REVIEW_STATUSES, see statusGroups.js).
-async function markNoNeedLegalRequest(id, body) {
+// Waive marks a contract that legal has determined doesn't require review, signing
+// it directly — replaces the old "No Need" action (which parked the request at a
+// dead-end 'No Needed' status instead of letting it proceed). Comment is mandatory
+// (re-checked here since the server never trusts client-side validation alone),
+// unlike the old No Need action which had none — a real substantive outcome
+// (advancing straight to Signed) needs a recorded reason. Saves any edited fields
+// too, same as Terminate/Cancel below, since this is now that same weight of action.
+// Also overwrites remark to 'waived' (regardless of what it was before) — same as
+// approvalController's own waiveRequest — so the Remark checklist/badge/PDF all show
+// "Waived" for any contract that went through either waive path.
+async function waiveLegalRequest(id, body) {
+  if (!body.comment || !body.comment.trim()) throw new ApiError(400, 'Comment is required.');
+
   return sequelize.transaction(async transaction => {
     const options = { transaction };
     await lockRequest(id, options);
 
-    await insertLegalHistory(id, 'No Need', body.updatedName, body.emId, options);
+    await updateEditableFields(id, body, 'Signed', options);
 
-    await exec(
-      `UPDATE contract_requests SET status = 'No Needed', updated_by = :emId, updated_name = :updatedName, updated_at = NOW() WHERE id = :id`,
-      { id, emId: body.emId || null, updatedName: body.updatedName || null },
-      options
-    );
+    await exec(`UPDATE contract_requests SET remark = 'waived' WHERE id = :id`, { id }, options);
 
-    return { id: Number(id), status: 'No Needed' };
+    await insertComment(id, body.comment, body.updatedName, LEGAL_COMMENT_ROLE, body.emId, options);
+
+    await insertLegalHistory(id, 'Waive', body.updatedName, body.emId, options);
+
+    return { id: Number(id), status: 'Signed' };
   });
 }
 
@@ -163,9 +170,9 @@ export async function terminate(req, res) {
   }
 }
 
-export async function noNeed(req, res) {
+export async function waive(req, res) {
   try {
-    const result = await markNoNeedLegalRequest(req.params.id, req.body || {});
+    const result = await waiveLegalRequest(req.params.id, req.body || {});
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);

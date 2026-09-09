@@ -5,7 +5,11 @@ import { select } from '../../config/mysql.js';
 // IS the contract registry; a contract and the request that created it are the same
 // row, just further along in `status`.
 // ---------------------------------------------------------------------------
-export async function listContracts(req, res) {
+
+// Shared by listContracts and exportContracts below — both filter the exact same
+// rows, just render them differently (one page of grouped table rows vs. every
+// matching row flattened into a report), so the WHERE clause only needs writing once.
+function buildWhere(query) {
   const {
     supplier = '',
     contractNo = '',
@@ -19,9 +23,7 @@ export async function listContracts(req, res) {
     createdBy = '',
     approverEmId = '',
     legalCheck = '',
-    page = '1',
-    pageSize = '10',
-  } = req.query;
+  } = query;
 
   const clauses = ['c.deleted_at IS NULL'];
   const replacements = {};
@@ -84,7 +86,13 @@ export async function listContracts(req, res) {
     });
   }
 
-  const where = clauses.join(' AND ');
+  return { where: clauses.join(' AND '), replacements };
+}
+
+export async function listContracts(req, res) {
+  const { page = '1', pageSize = '10' } = req.query;
+  const { where, replacements } = buildWhere(req.query);
+
   const pageNum = Math.max(1, parseInt(page, 10) || 1);
   const size = Math.max(1, parseInt(pageSize, 10) || 10);
   const offset = (pageNum - 1) * size;
@@ -136,4 +144,28 @@ export async function listContracts(req, res) {
   ]);
 
   res.json({ items, total: Number(totalRows[0].count), page: pageNum, pageSize: size });
+}
+
+// Home's Export button (see ContractFilters.jsx) — every row matching the current
+// filters, ignoring pagination entirely (unlike listContracts above, no LIMIT/OFFSET),
+// flattened into report order (by request_date, the date the request was actually
+// submitted — "เรียงตามวันที่ขอสัญญาในระบบ") rather than the grouped supplier/master-
+// contract order the on-screen table uses, plus the extra fields the report needs
+// that the table doesn't (Effective/Expired Date from Upload Sign Contract, Requestor).
+export async function exportContracts(req, res) {
+  const { where, replacements } = buildWhere(req.query);
+
+  const items = await select(
+    `SELECT c.id, c.request_date AS requestDate, c.contract_no AS contractNo, c.supplier_name AS supplier,
+            ct.name AS type, c.contract_purpose AS purpose, c.remark, c.status,
+            c.contract_start_date AS effectiveDate, c.expire_date AS expiredDate,
+            c.requestor_name AS requestorName, c.requestor_section AS section
+     FROM contract_requests c
+     LEFT JOIN contract_types ct ON ct.id = c.contract_type_id
+     WHERE ${where}
+     ORDER BY c.request_date ASC, c.id ASC`,
+    replacements
+  );
+
+  res.json({ items });
 }

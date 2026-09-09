@@ -1,4 +1,6 @@
 import { exec, select, insert } from '../config/mysql.js';
+import { sendContractRequestEmail } from '../app/services/contractEmail.service.js';
+import { getEmployeeEmail } from '../app/services/employeeLookup.service.js';
 
 // Shared between the New Request POST, the Edit modal's PATCH, and the approval/legal
 // workflow controllers — every entry point that lets a user touch a contract_requests
@@ -234,4 +236,158 @@ export async function insertComment(id, comment, commenterName, role, emId, opti
     { id, comment, commenterName: commenterName || null, role, emId: emId || null },
     options
   );
+}
+
+// ---------------------------------------------------------------------------
+// Contract Request email notifications (services/contractEmail.service.js) — data
+// assembly shared by requestController's createRequest (Send Request -> notify
+// Approver 1) and approvalController's approveRequest (Approve -> notify whichever
+// approver is next). Both controllers already work with the exact same body shape
+// (supplierName/contractTypeId/contractPurpose/... — see updateEditableFields above),
+// so this is the one place that turns that body into the requestType-specific data
+// shape sendContractRequestEmail expects, instead of duplicating it per controller.
+// ---------------------------------------------------------------------------
+
+const REQUEST_TYPE_BY_REMARK = {
+  new: 'NEW',
+  renew: 'RENEW',
+  amend: 'AMENDMENT',
+  terminate: 'TERMINATION',
+  claim: 'CLAIM_NOTE',
+  cancel: 'CANCEL',
+};
+
+// "1 July 2026" — matches the spec's own example formatting. No existing friendly-date
+// formatter exists elsewhere in this backend (app/utils/dateUtils.js's toDateOnly is
+// YYYY-MM-DD, for feeding the New Request form, not for display in an email).
+const MONTH_NAMES = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+function formatEmailDate(value) {
+  if (!value) return '';
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+// "500,000 JPY" — total_net_price (a plain decimal) plus currency, comma-grouped.
+function formatNetPrice(totalNetPrice, currency) {
+  if (totalNetPrice == null || totalNetPrice === '') return '';
+  const num = Number(totalNetPrice);
+  const formatted = Number.isNaN(num) ? String(totalNetPrice) : num.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return currency ? `${formatted} ${currency}` : formatted;
+}
+
+// Returns null for a remark with no notification email defined (e.g. 'waived', which
+// only ever happens via Waive — see approvalController.js — not a fresh Send
+// Request/Approve call this is invoked from).
+export async function buildContractEmailData({ body, remark, contractNo, requestorName, approverEmail, cc, bcc, linkedMasterId, systemUrl }) {
+  const requestType = REQUEST_TYPE_BY_REMARK[remark];
+  if (!requestType) return null;
+
+  let contractType = '';
+  if (body.contractTypeId) {
+    const rows = await select(`SELECT name FROM contract_types WHERE id = :id`, { id: body.contractTypeId });
+    contractType = rows[0]?.name || '';
+  }
+
+  // "{name} / {section}" — e.g. "Thitinun Chaychayanon / Legal", matching the spec's
+  // own example ("Kamon nate/Legal") once "Legal" is read as the requestor's section,
+  // not a role label. Falls back to the bare name when section is somehow blank.
+  const requestorNameValue = requestorName || body.requestorName || '';
+  const requestorSection = body.requestorSection || '';
+  const base = {
+    requestType,
+    contractNo: contractNo || '',
+    supplierName: body.supplierName || '',
+    contractType,
+    requestor: requestorSection ? `${requestorNameValue} / ${requestorSection}` : requestorNameValue,
+    approverEmail,
+    systemUrl,
+  };
+  if (cc && cc.length) base.cc = cc;
+  if (bcc && bcc.length) base.bcc = bcc;
+
+  switch (requestType) {
+    case 'NEW':
+      return {
+        ...base,
+        purpose: body.briefDescription || '',
+        netPrice: formatNetPrice(body.totalNetPrice, body.currency),
+        delivery: formatEmailDate(body.deliveryDate),
+      };
+    case 'RENEW': {
+      // Original Period is read fresh from the referenced contract (linked_master_id),
+      // same "never drift out of sync" reasoning requestController.js's getRequest
+      // already uses for this exact lookup — just its expire_date here, matching the
+      // spec's own single-date example rather than a full start-end range.
+      let originalPeriod = '';
+      if (linkedMasterId) {
+        const rows = await select(`SELECT expire_date FROM contract_requests WHERE id = :id`, { id: linkedMasterId });
+        originalPeriod = formatEmailDate(rows[0]?.expire_date);
+      }
+      return {
+        ...base,
+        purpose: body.actionBackground || '',
+        originalPeriod,
+        newPeriod: formatEmailDate(body.newContractEndDate),
+      };
+    }
+    case 'AMENDMENT':
+      return {
+        ...base,
+        reason: body.actionBackground || '',
+        amendedDetail: body.actionDetail || '',
+        effectiveDate: formatEmailDate(body.actionEffectiveDate),
+      };
+    case 'TERMINATION':
+      return {
+        ...base,
+        reason: body.actionBackground || '',
+        effectiveDate: formatEmailDate(body.actionEffectiveDate),
+      };
+    case 'CLAIM_NOTE':
+      return {
+        ...base,
+        reason: body.actionBackground || '',
+        claimDetail: body.actionDetail || '',
+      };
+    case 'CANCEL':
+      return {
+        ...base,
+        purpose: body.briefDescription || '',
+        reason: body.cancelReason || '',
+      };
+    default:
+      return null;
+  }
+}
+
+// Single entry point requestController.js (Send Request -> Approver 1) and
+// approvalController.js (Approve -> next approver) both call after their own
+// transaction has already committed. Resolves emId -> email (employeeLookup.service.js),
+// builds the requestType-specific data (buildContractEmailData above), then calls
+// sendContractRequestEmail (contractEmail.service.js) — the one place both controllers
+// actually invoke it from, so neither builds HTML or touches the transporter itself.
+//
+// Deliberately swallows its own errors (logged, never rethrown): a notification
+// failure (SMTP down, no email on file for that em_id, ...) must never fail the
+// approval/send-request action whose transaction already committed successfully —
+// sendContractRequestEmail itself still never swallows a real send failure, this is
+// only the outer boundary stopping that from reaching the controller's response.
+export async function notifyApproverForContractRequest(emId, { body, remark, contractNo, requestorName, linkedMasterId, systemUrl }) {
+  if (!emId) return;
+  try {
+    const approverEmail = await getEmployeeEmail(emId);
+    if (!approverEmail) {
+      console.error(`Contract email sending failed: no email on file for approver em_id "${emId}".`);
+      return;
+    }
+    const emailData = await buildContractEmailData({ body, remark, contractNo, requestorName, approverEmail, linkedMasterId, systemUrl });
+    if (!emailData) return; // e.g. remark === 'waived' — no notification email defined for it
+    await sendContractRequestEmail(emailData);
+  } catch (error) {
+    console.error('Contract request approver notification failed:', error);
+  }
 }

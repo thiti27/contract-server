@@ -1,13 +1,13 @@
 import { sequelize, select, exec, insert } from '../../config/mysql.js';
-import { updateEditableFields, insertComment } from '../../helpers/contractRequestHelper.js';
+import { updateEditableFields, insertComment, notifyApproverForContractRequest } from '../../helpers/contractRequestHelper.js';
 import { ApiError } from '../utils/apiError.js';
 import { handleApprovalError } from '../middleware/errorHandler.js';
 
 // ---------------------------------------------------------------------------
-// Approval workflow (Waiting Approve screen) — Approve / Return / Reject, each
-// atomic (single Sequelize transaction: edited fields, comment, approval history,
-// status transition, and — on Approve reaching Drafted — contract number
-// generation all commit or roll back together).
+// Approval workflow (Waiting Approve screen) — Approve / Return / Reject / Waive,
+// each atomic (single Sequelize transaction: edited fields, comment, approval
+// history, status transition, and — on Approve reaching Drafted or on Waive —
+// contract number generation all commit or roll back together).
 // ---------------------------------------------------------------------------
 
 // Approving Waiting Approver N moves the request to the next stage; Approver 3 is the
@@ -137,7 +137,7 @@ async function generateContractNo(remark, referContractNo, options) {
 // `lockRequestForUpdate(id, { columns, requireStatus }, options)` helper instead.
 async function lockRequest(id, options) {
   const rows = await select(
-    `SELECT status, created_by, refer_contract_no, linked_master_id, remark, requestor_name,
+    `SELECT status, created_by, refer_contract_no, linked_master_id, remark, requestor_name, contract_no,
             approver1_em_id, approver2_em_id, approver3_em_id
      FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
     { id },
@@ -148,11 +148,20 @@ async function lockRequest(id, options) {
 }
 
 async function approveRequest(id, body) {
-  return sequelize.transaction(async transaction => {
+  // Captured inside the transaction below, read again after it commits — notifying
+  // the next approver only makes sense once the status change has actually persisted,
+  // and a notification failure (see notifyApproverForContractRequest's own "never
+  // fail the caller" contract) must never roll back an approval that already succeeded.
+  let existingForEmail = null;
+  let nextStatusForEmail = null;
+
+  const result = await sequelize.transaction(async transaction => {
     const options = { transaction };
     const existing = await lockRequest(id, options);
+    existingForEmail = existing;
 
     const nextStatus = resolveNextStatus(existing);
+    nextStatusForEmail = nextStatus;
     if (!nextStatus) throw new ApiError(400, `Cannot approve a request with status "${existing.status}".`);
     // True only for the specific approve call that completes a Cancel request's own
     // approval chain (Approver 3, Waiting Approver 3 -> Drafted) — Approver 1/2's
@@ -237,6 +246,96 @@ async function approveRequest(id, body) {
 
     return { id: Number(id), status: nextStatus, contractNo };
   });
+
+  // Approving Waiting Approver 1/2 hands the request to whichever approver is next
+  // (see resolveNextStatus above — Approver 2 if set, otherwise straight to Approver
+  // 3). Waiting Approver 3 -> Drafted is the chain finishing, not a handoff, so no
+  // notification there. existingForEmail.contract_no is whatever the row already had
+  // going into this call (a placeholder for Renew/Amend/Claim/Terminate, still null for
+  // a 'new' remark) — a real number is only minted at the Drafted transition above.
+  const nextApproverEmId =
+    nextStatusForEmail === 'Waiting Approver 2'
+      ? existingForEmail.approver2_em_id
+      : nextStatusForEmail === 'Waiting Approver 3'
+        ? existingForEmail.approver3_em_id
+        : null;
+  if (nextApproverEmId) {
+    await notifyApproverForContractRequest(nextApproverEmId, {
+      body,
+      remark: existingForEmail.remark,
+      contractNo: existingForEmail.contract_no,
+      requestorName: existingForEmail.requestor_name,
+      linkedMasterId: existingForEmail.linked_master_id,
+      systemUrl: body.systemUrl,
+    });
+  }
+
+  return result;
+}
+
+// Waive fast-tracks a request straight to 'Signed', skipping the rest of the
+// approval chain — but only from 'Waiting Approver 3', the last stage. Approver
+// 1/2 must go through Approve normally instead (re-enforced here, not just hidden
+// client-side — the button itself is only shown at that status in EditRequestModal,
+// but the server never trusts that alone). Comment is mandatory (unlike Approve,
+// where it's optional), same as Return/Reject above, since bypassing the rest of the
+// approval chain needs a recorded reason.
+//
+// A Cancel request (remark = 'cancel') can never be waived — unlike every other
+// remark, it isn't a contract in its own right; its own approval completing is what
+// cancels the ORIGINAL linked contract (see isCancelCompletion above), so setting
+// its own status to 'Signed' would be meaningless and would never actually cancel
+// anything. Every other remark (new/renew/amend/claim/terminate) waives the same way
+// Approve normally reaches Drafted: this still mints a real contract_no (same
+// generateContractNo call, same remark-branch rule) so a waived Signed contract is
+// numbered exactly like any other, and still records Approver 3's own stage
+// signature — Waive is "approve the last stage and skip straight to Signed", not a
+// different kind of outcome.
+async function waiveRequest(id, body) {
+  if (!body.comment || !body.comment.trim()) throw new ApiError(400, 'Comment is required.');
+
+  return sequelize.transaction(async transaction => {
+    const options = { transaction };
+    const existing = await lockRequest(id, options);
+
+    if (existing.status !== 'Waiting Approver 3') {
+      throw new ApiError(400, `Cannot waive a request with status "${existing.status}".`);
+    }
+    if (existing.remark === 'cancel') {
+      throw new ApiError(400, 'A Cancel request cannot be waived.');
+    }
+
+    await updateEditableFields(id, body, 'Signed', options);
+
+    const stageColumn = STAGE_COLUMN[existing.status];
+    const signature = formatSignature(body.approverFirstName, body.approverLastName);
+    await exec(
+      `UPDATE contract_requests SET ${stageColumn}_name = :signature, ${stageColumn}_approved_at = NOW() WHERE id = :id`,
+      { id, signature },
+      options
+    );
+
+    const role = computeApprovalCommentRole(existing, body.emId);
+    await insertComment(id, body.comment, body.updatedName, role, body.emId, options);
+
+    await insertApprovalHistory(id, 'Waive', body.emId, body.updatedName, options);
+
+    // generateContractNo is keyed off existing.remark (captured before this row's own
+    // remark gets overwritten below) — a waived Renew/Amend/Claim Note/Terminate still
+    // numbers itself as that same revision type, only the persisted remark itself
+    // becomes 'waived' afterward (see the Remark checklist requirement this satisfies:
+    // the PDF/badge/radio group all show "Waived" once a request has gone this route,
+    // regardless of what it originally was).
+    const referContractNo = (body.referContractNo || '').trim() || null;
+    const contractNo = await generateContractNo(existing.remark, referContractNo, options);
+    await exec(
+      `UPDATE contract_requests SET contract_no = :contractNo, remark = 'waived' WHERE id = :id`,
+      { id, contractNo },
+      options
+    );
+
+    return { id: Number(id), status: 'Signed', contractNo };
+  });
 }
 
 async function returnRequest(id, body) {
@@ -278,6 +377,15 @@ async function rejectRequest(id, body) {
 export async function approve(req, res) {
   try {
     const result = await approveRequest(req.params.id, req.body || {});
+    res.json(result);
+  } catch (err) {
+    handleApprovalError(err, res);
+  }
+}
+
+export async function waive(req, res) {
+  try {
+    const result = await waiveRequest(req.params.id, req.body || {});
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);

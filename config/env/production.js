@@ -10,9 +10,13 @@
 // context, still inert.)
 export default {
   PORT: 1312,
-  DB_HOST: '127.0.0.1',
+  DB_HOST: '159.228.251.212',
   DB_PORT: '3306',
   DB_USER: 'root',
-  DB_PASSWORD: '12345',
+  DB_PASSWORD: 'D@!cel009',
   DB_NAME: 'contract_db',
+  EMAIL_HOST: '10.227.101.30',
+  EMAIL_PORT: 25,
+  EMAIL_FROM: 'Contract_Online@dsst.Daicel.com',
+  SYSTEM_URL: 'https://contract-online.example.com',
 };

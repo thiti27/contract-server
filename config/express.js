@@ -8,20 +8,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // relative depth server.js's own __dirname used to sit at before this refactor.
 const projectRoot = path.join(__dirname, '..');
 
-// Serves the React frontend build — computed here (not inline in createApp) so the
-// SPA fallback route (app/routes/spa.routes.js) can reuse the exact same path
-// instead of recomputing it.
-export const clientBuildPath = path.join(projectRoot, '../client/build');
-
 export function createApp() {
   const app = express();
-  app.use(cors());
+  // Content-Disposition isn't one of the browser's default CORS-safelisted response
+  // headers — without explicitly exposing it, the frontend's own download helpers
+  // (downloadUploadFile, downloadUploadFileFromPath) can't read the real filename+
+  // extension res.download() below (and uploadController.downloadUpload) sets, and end
+  // up saving the file with no extension at all.
+  app.use(cors({ exposedHeaders: ['Content-Disposition'] }));
   app.use(express.json());
   app.use('/files', express.static(path.join(projectRoot, 'storage')));
-
-  // === เพิ่มด้านล่างนี้ ===
-  // Serve React frontend
-  app.use(express.static(clientBuildPath));
 
   return app;
 }

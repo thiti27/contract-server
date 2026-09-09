@@ -9,4 +9,11 @@ export default {
   DB_USER: 'root',
   DB_PASSWORD: '12345',
   DB_NAME: 'contract_db',
+  EMAIL_HOST: '10.227.101.30',
+  EMAIL_PORT: 25,
+  EMAIL_FROM: 'Contract_Online@dsst.Daicel.com',
+  // Placeholder until the real deployed URL is known — every caller can still override
+  // this per-email via data.systemUrl (see contractEmail.service.js), so this default
+  // only matters when a caller doesn't pass one.
+  SYSTEM_URL: 'https://contract-online.example.com',
 };

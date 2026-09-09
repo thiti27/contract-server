@@ -15,4 +15,12 @@ export default {
     password: process.env.DB_PASSWORD || envDefaults.DB_PASSWORD,
     name: process.env.DB_NAME || envDefaults.DB_NAME,
   },
+  email: {
+    host: process.env.EMAIL_HOST || envDefaults.EMAIL_HOST,
+    port: process.env.EMAIL_PORT || envDefaults.EMAIL_PORT,
+    from: process.env.EMAIL_FROM || envDefaults.EMAIL_FROM,
+  },
+  // Used as the Contract Online System link's default target whenever a caller of
+  // sendContractRequestEmail doesn't pass its own data.systemUrl.
+  systemUrl: process.env.SYSTEM_URL || envDefaults.SYSTEM_URL,
 };

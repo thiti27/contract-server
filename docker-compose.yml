@@ -18,3 +18,6 @@ services:
           memory: 200M
     environment:
       NODE_ENV: production
+      JWT_SECRET: 2c1f6f154f3ec3098a2084416567614c623231aa1560f3d5c4420d704bb222d5
+      DB_HOST: 159.228.251.212
+      DB_PASSWORD: "D@!cel009"

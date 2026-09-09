@@ -58,9 +58,13 @@ CREATE TABLE IF NOT EXISTS admin_users (
   created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME,
   deleted_at    DATETIME,
-  created_by    VARCHAR(6),
-  updated_by    VARCHAR(6),
-  deleted_by    VARCHAR(6)
+  -- Wider than every other table's created_by/updated_by/deleted_by (VARCHAR(6), an
+  -- em_id) on purpose — Settings > Role Management (roleController.js) stores the
+  -- acting user's actual display name here ("Firstname Lastname"), not their em_id,
+  -- per that page's own audit-trail requirement.
+  created_by    VARCHAR(150),
+  updated_by    VARCHAR(150),
+  deleted_by    VARCHAR(150)
 );
 
 CREATE INDEX idx_admin_users_em_id ON admin_users (em_id);
@@ -246,7 +250,7 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   requestor_name      VARCHAR(300) NOT NULL,
   requestor_section   VARCHAR(150) NOT NULL,
   remark              VARCHAR(20) NOT NULL DEFAULT 'new'
-                        CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel')),
+                        CHECK (remark IN ('new', 'renew', 'amend', 'claim', 'terminate', 'cancel', 'waived')),
 
   -- 3 signature slots: Manager (required), Supervisor #1 (required), Supervisor #2
   -- (optional). Each stores employees.em_id directly, not the surrogate id — and not
@@ -279,8 +283,7 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   contract_start_date         DATE,
   auto_renewal                TINYINT(1),      -- 1 = Auto Renewal, 0 = No Auto Renewal (only meaningful when has_expiry = 1)
   auto_renewal_years          INT,             -- only set when auto_renewal = 1
-  renewal_condition           VARCHAR(500),    -- unused — the Renewal Condition field was removed from
-                                                -- Upload Sign Contract; column kept only for existing rows
+  renewal_condition           VARCHAR(500),    -- optional free text, only when has_expiry = 1
   reminder_before_expiry_days SMALLINT,        -- one of 15/30/45/60/90, only when has_expiry = 1 AND auto_renewal = 1
 
   active              TINYINT(1) NOT NULL DEFAULT 1,
@@ -318,7 +321,7 @@ CREATE TABLE IF NOT EXISTS contract_request_comments (
 
 CREATE INDEX idx_crc_request ON contract_request_comments (contract_request_id);
 
--- Approval workflow history (Approve / Return / Reject) — one row per action taken on a
+-- Approval workflow history (Approve / Return / Reject / Waive) — one row per action taken on a
 -- request. Comments live only in contract_request_comments; this table is action log only.
 -- `created_by_name` is the acting user's display name captured at the moment of the
 -- action (their own session, see /api/login's first_name/last_name) so the Approval >
@@ -326,7 +329,7 @@ CREATE INDEX idx_crc_request ON contract_request_comments (contract_request_id);
 CREATE TABLE IF NOT EXISTS contract_approval_history (
   id                   INT AUTO_INCREMENT PRIMARY KEY,
   contract_request_id  INT NOT NULL,
-  action               VARCHAR(20) NOT NULL CHECK (action IN ('Approve', 'Return', 'Reject')),
+  action               VARCHAR(20) NOT NULL CHECK (action IN ('Approve', 'Return', 'Reject', 'Waive')),
   created_by_name      VARCHAR(300),
   active               TINYINT(1) NOT NULL DEFAULT 1,
 
@@ -340,7 +343,7 @@ CREATE TABLE IF NOT EXISTS contract_approval_history (
 
 CREATE INDEX idx_cah_request ON contract_approval_history (contract_request_id);
 
--- Legal review history (Check / Terminate) — one row per action taken by Legal on a
+-- Legal review history (Check / Terminate / Waive) — one row per action taken by Legal on a
 -- request. Comments live only in contract_request_comments (role 'LG'); this table is
 -- action log only, shown on Legal > History (not filtered by created_by — every legal
 -- user shares one queue and one history). `by` is the acting user's display name
@@ -348,7 +351,7 @@ CREATE INDEX idx_cah_request ON contract_approval_history (contract_request_id);
 CREATE TABLE IF NOT EXISTS contract_legal_history (
   id                   INT AUTO_INCREMENT PRIMARY KEY,
   contract_request_id  INT NOT NULL,
-  action               VARCHAR(20) NOT NULL CHECK (action IN ('Check', 'Terminate', 'No Need', 'Cancel')),
+  action               VARCHAR(20) NOT NULL CHECK (action IN ('Check', 'Terminate', 'No Need', 'Cancel', 'Waive')),
   `by`                 VARCHAR(300), -- backtick-quoted: `by` is a reserved word in MySQL
   active               TINYINT(1) NOT NULL DEFAULT 1,
 
