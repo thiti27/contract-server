@@ -26,10 +26,13 @@ export function buildContractEmailHtml({ title, from, introText, rows, systemUrl
     )
     .join('');
 
-  // "Contract Online System" appears twice — once inline in the request message,
-  // once as the sign-off — both as a clickable link to data.systemUrl (section 14 of
-  // the spec: the phrase itself must be an <a href target="_blank"> link).
+  // "Contract Online System" appears twice: inline in "Please log in the ___ to
+  // review" (still a clickable link to data.systemUrl — an approver actually needs to
+  // get there from this sentence) and again as the closing sign-off, which is now
+  // plain black text with no link at all, same as every other contract email's own
+  // sign-off (approvedContract/returnContract/waivedContract.template.js).
   const systemLink = `<a href="${escapeHtml(systemUrl)}" target="_blank" style="color: #1a73e8;">Contract Online System</a>`;
+  const systemLinkPlain = `<span style="color: #000000;">Contract Online System</span>`;
 
   return `
 <!DOCTYPE html>
@@ -49,7 +52,7 @@ export function buildContractEmailHtml({ title, from, introText, rows, systemUrl
           </table>
           <br/>
           <div>Best Regards</div>
-          <div>${systemLink}</div>
+          <div>${systemLinkPlain}</div>
         </td>
       </tr>
     </table>

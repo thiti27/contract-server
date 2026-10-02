@@ -18,5 +18,7 @@ export default {
   EMAIL_HOST: '10.227.101.30',
   EMAIL_PORT: 25,
   EMAIL_FROM: 'Contract_Online@dsst.Daicel.com',
-  SYSTEM_URL: 'https://contract-online.example.com',
+  // The real deployed Contract Online System web app (frontend on port 7012) — see
+  // development.js's own comment on this same key.
+  SYSTEM_URL: 'http://159.228.251.234:7012/',
 };

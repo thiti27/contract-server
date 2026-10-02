@@ -1,6 +1,7 @@
 import { sequelize, select, exec } from '../../config/mysql.js';
 import { ApiError } from '../utils/apiError.js';
 import { handleApprovalError } from '../middleware/errorHandler.js';
+import { logActivity } from '../utils/activityLog.js';
 
 // ---------------------------------------------------------------------------
 // Upload Sign Contract (More > Upload Sign Contract, only while status = 'Drafted') —
@@ -138,6 +139,55 @@ async function uploadSignedContract(id, body) {
 export async function uploadSigned(req, res) {
   try {
     const result = await uploadSignedContract(req.params.id, req.body || {});
+    await logActivity(req, 'upload_signed_contract', { entityType: 'contract_request', entityId: Number(req.params.id) });
+    res.json(result);
+  } catch (err) {
+    handleApprovalError(err, res);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Original At (Home's More menu, only offered while status = 'Signed', or
+// 'Terminated' when the acting user has `legal` — see ContractTable.jsx) — a plain
+// confirm-and-flip between two states, not free text: 0 = with the requestor's own
+// section (the "owner"), 1 = confirmed physically at Legal.
+// ---------------------------------------------------------------------------
+
+async function lockSignedOrTerminatedRequest(id, options) {
+  const rows = await select(`SELECT status FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`, { id }, options);
+  if (!rows.length) throw new ApiError(404, 'Contract request not found.');
+  if (rows[0].status !== 'Signed' && rows[0].status !== 'Terminated') {
+    throw new ApiError(400, `Original At can only be set for a Signed or Terminated contract, not "${rows[0].status}".`);
+  }
+  return rows[0];
+}
+
+async function setOriginalAtLegal(id, body) {
+  return sequelize.transaction(async transaction => {
+    const options = { transaction };
+    await lockSignedOrTerminatedRequest(id, options);
+
+    await exec(
+      `UPDATE contract_requests SET
+         original_at_legal = :legal,
+         updated_by = :emId, updated_name = :updatedName, updated_at = NOW()
+       WHERE id = :id`,
+      { id, legal: body.legal ? 1 : 0, emId: body.emId || null, updatedName: body.updatedName || null },
+      options
+    );
+
+    return { id: Number(id), originalAtLegal: !!body.legal };
+  });
+}
+
+export async function originalAt(req, res) {
+  try {
+    const result = await setOriginalAtLegal(req.params.id, req.body || {});
+    await logActivity(req, 'set_original_at', {
+      entityType: 'contract_request',
+      entityId: Number(req.params.id),
+      detail: result.originalAtLegal ? 'Legal' : 'Owner',
+    });
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);

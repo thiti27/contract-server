@@ -1,5 +1,6 @@
 import { select, exec, insert } from '../../config/mysql.js';
 import { GLOBAL_DOC_KEYS } from '../utils/statusGroups.js';
+import { logActivity } from '../utils/activityLog.js';
 
 const DOC_LABELS = {
   contract_procedure: 'Contract Procedure',
@@ -86,5 +87,6 @@ export async function setGlobalDocument(req, res) {
     );
   }
 
+  await logActivity(req, 'global_document_upload', { entityType: 'global_document', detail: `${key}: ${file.fileName}${file.extension}` });
   res.status(201).json({ docKey: key, filePath });
 }

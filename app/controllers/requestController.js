@@ -14,6 +14,7 @@ import { NEW_REQUEST_STATUS, EDIT_ACTION_STATUS } from '../utils/statusGroups.js
 import { toDateOnly } from '../utils/dateUtils.js';
 import { ApiError } from '../utils/apiError.js';
 import { handleApprovalError } from '../middleware/errorHandler.js';
+import { logActivity } from '../utils/activityLog.js';
 
 // Amend/Renew/Terminate/Claim Note/Cancel — all 5 show the Reference Item's own
 // contract_no from the moment they're created (Save Draft or Send Request):
@@ -26,6 +27,16 @@ import { handleApprovalError } from '../middleware/errorHandler.js';
 //   EXACT contract the user clicked Cancel on, whether that's a base contract or one of
 //   its own revisions — see referContractNo below).
 const REFER_CONTRACT_NO_PLACEHOLDER_REMARKS = ['amend', 'renew', 'terminate', 'claim', 'cancel'];
+
+// updateRequest's `action` body field (EDIT_ACTION_STATUS's own keys) -> the
+// activity_logs `action` value — kept distinct from the raw field name so the log
+// reads as a verb ("send_request") rather than a URL-ish token ("send-request").
+const ACTION_LOG_NAME = {
+  'save-change': 'save_change',
+  cancel: 'cancel_request',
+  'save-draft': 'save_draft',
+  'send-request': 'send_request',
+};
 
 // ---------------------------------------------------------------------------
 // New contract requests (draft or sent) from the New Request form
@@ -70,6 +81,7 @@ async function createRequestBody(req, res) {
   const requestId = await insert(
     `INSERT INTO contract_requests (
        status, confidentiality, contract_type_id, contract_purpose, other_specify,
+       construction_risk_level, construction_risk_score, construction_risk_answers,
        supplier_name, contract_year, request_date, delivery_date, location, warranty_period, refer_contract_no, linked_master_id,
        contract_no,
        brief_description, action_background, action_detail,
@@ -81,6 +93,7 @@ async function createRequestBody(req, res) {
        created_by, updated_by, updated_name, updated_at
      ) VALUES (
        :status, :confidentiality, :contractTypeId, :contractPurpose, :otherSpecify,
+       :constructionRiskLevel, :constructionRiskScore, :constructionRiskAnswers,
        :supplierName, YEAR(:requestDate), :requestDate, :deliveryDate, :location, :warrantyPeriod, :referContractNo, :linkedMasterId,
        :contractNo,
        :briefDescription, :actionBackground, :actionDetail,
@@ -97,6 +110,9 @@ async function createRequestBody(req, res) {
       contractTypeId: body.contractTypeId || null,
       contractPurpose: body.contractPurpose || null,
       otherSpecify: body.otherSpecify || null,
+      constructionRiskLevel: body.constructionRiskLevel || null,
+      constructionRiskScore: body.constructionRiskScore ?? null,
+      constructionRiskAnswers: body.constructionRiskAnswers ? JSON.stringify(body.constructionRiskAnswers) : null,
       supplierName: body.supplierName || '',
       requestDate: body.requestDate || null,
       deliveryDate: body.deliveryDate || null,
@@ -160,8 +176,17 @@ async function createRequestBody(req, res) {
       requestorName: body.requestorName,
       linkedMasterId,
       systemUrl: body.systemUrl,
+      contractRequestId: requestId,
     });
   }
+
+  await logActivity(req, status === 'Waiting Approver 1' ? 'send_request' : 'save_draft', {
+    emId: body.emId || null,
+    userName: body.updatedName || null,
+    entityType: 'contract_request',
+    entityId: requestId,
+    detail: `${remark} — ${contractNo || body.supplierName || ''}`.trim(),
+  });
 
   res.status(201).json({ id: requestId, status });
 }
@@ -251,6 +276,9 @@ export async function getRequest(req, res) {
     contractTypeId: row.contract_type_id,
     contractPurpose: row.contract_purpose || '',
     otherSpecify: row.other_specify || '',
+    constructionRiskLevel: row.construction_risk_level || '',
+    constructionRiskScore: row.construction_risk_score ?? null,
+    constructionRiskAnswers: row.construction_risk_answers || null,
     contractNo: row.contract_no || '',
     supplierName: row.supplier_name || '',
     requestDate: toDateOnly(row.request_date),
@@ -318,6 +346,40 @@ const EDIT_STAGE_COLUMN = {
   'Waiting Approver 3': 'approver3_em_id',
 };
 
+// send-request used to hardcode 'Waiting Approver 1' for every resubmission —
+// correct for a first-time send from 'Saved', but wrong for resending after a
+// Return: an approver who returns a request mid-chain (Approver 2 or 3) already had
+// Approver 1 (and maybe 2) sign off before them, so restarting the whole chain from
+// Approver 1 made them re-approve something they'd already approved. Resuming at the
+// first stage that hasn't actually approved yet — read from approverN_approved_at,
+// which Approve (approvalController.js) sets and Return never touches, so it still
+// accurately reflects "who's already signed off" even after a Return — fixes this
+// without needing a new column: a fresh 'Saved' row has every approverN_approved_at
+// still NULL, so this still resolves to Approver 1 exactly like before. Same
+// approver2-optional skip as approvalController.js's own resolveNextStatus.
+//
+// `newApprovers` is this resubmission's own body.approvers (UI order: [Manager,
+// Supervisor1, Supervisor2], mapping to approver3/2/1 — same as updateEditableFields).
+// A stage only counts as already-done when BOTH its approved_at is set AND the em_id
+// assigned to that stage hasn't changed since — approverN_approved_at belongs to
+// whoever held that slot at approval time, so if the requestor reassigns Approver 1 (or
+// adds/changes Approver 2) while fixing a Returned request, the newly assigned person
+// has never actually signed off and must not be skipped just because the OLD
+// occupant's stale timestamp is still sitting on the row.
+function resolveResumeStatus(existing, newApprovers = []) {
+  const newApprover1EmId = newApprovers[2] || null;
+  const newApprover2EmId = newApprovers[1] || null;
+
+  const approver1Done = existing.approver1_approved_at && String(existing.approver1_em_id) === String(newApprover1EmId);
+  if (!approver1Done) return 'Waiting Approver 1';
+
+  const approver2Done =
+    !newApprover2EmId || (existing.approver2_approved_at && String(existing.approver2_em_id) === String(newApprover2EmId));
+  if (!approver2Done) return 'Waiting Approver 2';
+
+  return 'Waiting Approver 3';
+}
+
 export async function updateRequest(req, res) {
   const { id } = req.params;
   const body = req.body || {};
@@ -337,7 +399,8 @@ export async function updateRequest(req, res) {
       const options = { transaction };
       const existing = await select(
         `SELECT status, created_by, contract_no, refer_contract_no, linked_master_id, remark,
-                approver1_em_id, approver2_em_id, approver3_em_id
+                approver1_em_id, approver2_em_id, approver3_em_id,
+                approver1_approved_at, approver2_approved_at, approver3_approved_at
          FROM contract_requests WHERE id = :id AND deleted_at IS NULL FOR UPDATE`,
         { id },
         options
@@ -345,7 +408,10 @@ export async function updateRequest(req, res) {
       if (!existing.length) throw new ApiError(404, 'Contract request not found');
       existingForEmail = existing[0];
 
-      const status = EDIT_ACTION_STATUS[action] || existing[0].status;
+      const status =
+        action === 'send-request'
+          ? resolveResumeStatus(existing[0], body.approvers || [])
+          : EDIT_ACTION_STATUS[action] || existing[0].status;
       statusForEmail = status;
 
       await updateEditableFields(id, body, status, options);
@@ -358,13 +424,17 @@ export async function updateRequest(req, res) {
       return { id: Number(id), status };
     });
 
-    // Edit + Save only re-notifies when it actually reassigns the approver for the
-    // request's CURRENT stage — not on every save (that would re-spam the same
-    // approver every time a typo gets fixed), and not on Save Draft/Cancel/Send
-    // Request (send-request's own notification already happens in createRequest;
-    // there's no "current stage" yet on a still-Saved draft). approvers[] is UI row
-    // order top-to-bottom (Manager, Supervisor, Supervisor) — approvers[2]/[1]/[0] map
-    // to approver1/2/3 respectively, same mapping updateEditableFields itself uses.
+    // save-change (the only other action that can land here with a Waiting Approver *
+    // status — it keeps whatever status the row already had) only re-notifies when it
+    // actually reassigns the approver for the request's CURRENT stage, not on every
+    // save (that would re-spam the same approver every time a typo gets fixed).
+    // send-request is different: whether this is a first send from 'Saved' or a
+    // resend after a Return (resolveResumeStatus above), the approver at the resumed
+    // stage needs to know a request just landed in their queue either way — even when
+    // they're the same approver as before (the common case: nothing about the approval
+    // chain changed, just the content that was returned for a fix). approvers[] is UI
+    // row order top-to-bottom (Manager, Supervisor, Supervisor) — approvers[2]/[1]/[0]
+    // map to approver1/2/3 respectively, same mapping updateEditableFields itself uses.
     const stageColumn = EDIT_STAGE_COLUMN[statusForEmail];
     if (stageColumn && existingForEmail) {
       const approvers = body.approvers || [];
@@ -375,7 +445,7 @@ export async function updateRequest(req, res) {
       };
       const newEmId = newEmIdByColumn[stageColumn];
       const oldEmId = existingForEmail[stageColumn];
-      if (newEmId && newEmId !== oldEmId) {
+      if (newEmId && (action === 'send-request' || newEmId !== oldEmId)) {
         await notifyApproverForContractRequest(newEmId, {
           body,
           remark: existingForEmail.remark,
@@ -383,9 +453,18 @@ export async function updateRequest(req, res) {
           requestorName: body.requestorName,
           linkedMasterId: existingForEmail.linked_master_id,
           systemUrl: body.systemUrl,
+          contractRequestId: id,
         });
       }
     }
+
+    await logActivity(req, ACTION_LOG_NAME[action] || action, {
+      emId: body.emId || null,
+      userName: body.updatedName || null,
+      entityType: 'contract_request',
+      entityId: Number(id),
+      detail: existingForEmail ? `${existingForEmail.remark} — ${existingForEmail.contract_no || ''}`.trim() : null,
+    });
 
     res.json(result);
   } catch (err) {

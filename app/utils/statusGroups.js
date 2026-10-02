@@ -30,6 +30,12 @@ export const NEW_REQUEST_STATUS = { draft: 'Saved', submitted: 'Waiting Approver
 // the resulting status transition (server-side, never trusting a client-supplied
 // status directly). `save-change` intentionally keeps whatever status the row is
 // already at — editing an in-flight request doesn't restart its approval stage.
+// `send-request`'s value here is just a membership check (used to validate `action`
+// is one of these 4 strings) — requestController.js's updateRequest never reads it
+// for that key, computing the real resume stage itself instead (resolveResumeStatus:
+// Waiting Approver 1 for a first send, or the first stage that hasn't approved yet —
+// per approverN_approved_at — when resending after a Return, so an approver who
+// already signed off before it got returned doesn't have to re-approve).
 export const EDIT_ACTION_STATUS = {
   'save-change': null,
   cancel: 'Cancelled',

@@ -1,6 +1,7 @@
 import { exec, select, insert } from '../config/mysql.js';
 import { sendContractRequestEmail } from '../app/services/contractEmail.service.js';
 import { getEmployeeEmail } from '../app/services/employeeLookup.service.js';
+import config from '../config/config.js';
 
 // Shared between the New Request POST, the Edit modal's PATCH, and the approval/legal
 // workflow controllers — every entry point that lets a user touch a contract_requests
@@ -36,21 +37,23 @@ export function normalizeReferContractNo(contractNo) {
 // downloading one of its attached files by calling the API directly.
 //
 // This same check also guards getRequest(), which every mode (Edit, Approve, Legal
-// Review, View) fetches a contract's detail through — so on top of the 3 conditions
-// All Job/Home surface in the UI (creator, `view` permission, one of the 3 approvers),
-// `legal`/`admin` are also let through here: Waiting Approve/Waiting Check/Legal
-// History's own View button has never been confidentiality-gated (approvalMode's
-// RowActions branch in ContractTable.jsx ignores `restricted` entirely, since being in
-// that queue already means you're supposed to review the row) — omitting them here
-// would silently break legal review / approval for confidential contracts instead of
-// just tightening what All Job/Home already restrict.
+// Review, View) fetches a contract's detail through. Only `admin` gets a blanket pass
+// on top of the 3 conditions All Job/Home already surface in the UI (creator, `view`
+// permission, one of the 3 approvers) — `legal` alone is deliberately NOT one of them
+// (see the inline comment on the check itself below): a legal reviewer who needs to
+// open a HIGH CONFIDENTIAL contract they aren't the creator/approver of still needs
+// `view` set explicitly, same as anyone else.
 //
 // A non-confidential row is always accessible. approver slots that are null/undefined/
 // empty never count as a match, and em_ids are compared as strings so a numeric vs
 // string mismatch can't accidentally deny (or allow) access.
 export function hasConfidentialAccess(row, user) {
   if (!row?.confidentiality) return true;
-  if (user?.legal || user?.admin) return true;
+  // Being `legal` (or `admin`) is a role, not by itself a grant to read someone else's
+  // HIGH CONFIDENTIAL contract — same 3 conditions as everyone else (creator/`view`/one
+  // of the 3 approvers). A legal reviewer who genuinely needs to see confidential rows
+  // needs `view` set explicitly, same as any other user.
+  if (user?.admin) return true;
   const emId = user?.em_id != null ? String(user.em_id) : '';
   if (!emId) return false;
   if (String(row.created_by ?? '') === emId) return true;
@@ -77,7 +80,10 @@ export async function updateEditableFields(id, body, status, options = {}) {
   await exec(
     `UPDATE contract_requests SET
        status = :status, confidentiality = :confidentiality, contract_type_id = :contractTypeId,
-       contract_purpose = :contractPurpose, other_specify = :otherSpecify, supplier_name = :supplierName,
+       contract_purpose = :contractPurpose, other_specify = :otherSpecify,
+       construction_risk_level = :constructionRiskLevel, construction_risk_score = :constructionRiskScore,
+       construction_risk_answers = :constructionRiskAnswers,
+       supplier_name = :supplierName,
        contract_year = YEAR(:requestDate), request_date = :requestDate, delivery_date = :deliveryDate,
        location = :location, warranty_period = :warrantyPeriod, refer_contract_no = :referContractNo,
        linked_master_id = :linkedMasterId,
@@ -99,6 +105,9 @@ export async function updateEditableFields(id, body, status, options = {}) {
       contractTypeId: body.contractTypeId || null,
       contractPurpose: body.contractPurpose || null,
       otherSpecify: body.otherSpecify || null,
+      constructionRiskLevel: body.constructionRiskLevel || null,
+      constructionRiskScore: body.constructionRiskScore ?? null,
+      constructionRiskAnswers: body.constructionRiskAnswers ? JSON.stringify(body.constructionRiskAnswers) : null,
       supplierName: body.supplierName || '',
       requestDate: body.requestDate || null,
       deliveryDate: body.deliveryDate || null,
@@ -279,12 +288,22 @@ function formatNetPrice(totalNetPrice, currency) {
   return currency ? `${formatted} ${currency}` : formatted;
 }
 
-// Returns null for a remark with no notification email defined (e.g. 'waived', which
-// only ever happens via Waive — see approvalController.js — not a fresh Send
-// Request/Approve call this is invoked from).
+// requestType falls back to 'OTHER' for a remark with no type-specific field shape of
+// its own (currently just 'waived') rather than returning null — a row's remark
+// becomes 'waived' permanently once ANY waive happens (approvalController.js's
+// waiveRequest or legalController.js's waiveLegalRequest both overwrite it), so a
+// Signed/Drafted row Legal later Comments on, Terminates, or Cancels can easily still
+// carry remark='waived' at that point; buildRequestorNotificationData's callers
+// (notifyRequestorWaived/notifyRequestorLegalComment) still need SOME rows to show, not
+// a silently skipped email. 'OTHER' isn't a case in the switch below, so it falls
+// through to the shared `base` object only — buildDisplayRows' own `default` branch
+// then renders that as Supplier/Contract Type/Requestor, the fields every remark has in
+// common. This never reaches sendContractRequestEmail's own TEMPLATES/SUBJECTS lookup
+// (those key off the literal 'APPROVED'/'RETURN'/'WAIVED'/'LEGAL_COMMENT' each notify*
+// function hardcodes itself, not this requestType), so there's no risk of an
+// "Unsupported contract request type: OTHER" error reaching a real send.
 export async function buildContractEmailData({ body, remark, contractNo, requestorName, approverEmail, cc, bcc, linkedMasterId, systemUrl }) {
-  const requestType = REQUEST_TYPE_BY_REMARK[remark];
-  if (!requestType) return null;
+  const requestType = REQUEST_TYPE_BY_REMARK[remark] || 'OTHER';
 
   let contractType = '';
   if (body.contractTypeId) {
@@ -360,7 +379,9 @@ export async function buildContractEmailData({ body, remark, contractNo, request
         reason: body.cancelReason || '',
       };
     default:
-      return null;
+      // 'OTHER' (see this function's own comment above) — no type-specific fields to
+      // add, `base` alone is enough for buildDisplayRows' generic fallback.
+      return base;
   }
 }
 
@@ -376,7 +397,7 @@ export async function buildContractEmailData({ body, remark, contractNo, request
 // approval/send-request action whose transaction already committed successfully —
 // sendContractRequestEmail itself still never swallows a real send failure, this is
 // only the outer boundary stopping that from reaching the controller's response.
-export async function notifyApproverForContractRequest(emId, { body, remark, contractNo, requestorName, linkedMasterId, systemUrl }) {
+export async function notifyApproverForContractRequest(emId, { body, remark, contractNo, requestorName, linkedMasterId, systemUrl, contractRequestId }) {
   if (!emId) return;
   try {
     const approverEmail = await getEmployeeEmail(emId);
@@ -386,8 +407,341 @@ export async function notifyApproverForContractRequest(emId, { body, remark, con
     }
     const emailData = await buildContractEmailData({ body, remark, contractNo, requestorName, approverEmail, linkedMasterId, systemUrl });
     if (!emailData) return; // e.g. remark === 'waived' — no notification email defined for it
-    await sendContractRequestEmail(emailData);
+    await sendContractRequestEmail({ ...emailData, contractRequestId });
   } catch (error) {
     console.error('Contract request approver notification failed:', error);
+  }
+}
+
+// Every admin_users row flagged `legal` (active, not deleted) — no existing query
+// anywhere already builds this list (there was no Legal-notification email before),
+// so this is new. Resolves each em_id the same way an approver's em_id is resolved
+// (getEmployeeEmail against eds_db.employee), never assumes admin_users itself has an
+// email column (it doesn't).
+async function getLegalEmails(options = {}) {
+  const rows = await select(`SELECT em_id FROM admin_users WHERE legal = 1 AND active = 1 AND deleted_at IS NULL`, {}, options);
+  const emails = await Promise.all(rows.map(row => getEmployeeEmail(row.em_id)));
+  return emails.filter(Boolean);
+}
+
+// "Any question, please contact {name1} ({ext1}), {name2} ({ext2})" — legalComment
+// .template.js's own contact line, sorted by em_id ascending per that page's own
+// requirement. Only active, non-deleted Legal users count (same WHERE as
+// getLegalEmails above); a user with no ext on file just shows their name alone
+// rather than a blank "()" pair.
+async function getActiveLegalContactsLine(options = {}) {
+  const rows = await select(
+    `SELECT first_name AS firstName, ext FROM admin_users
+     WHERE legal = 1 AND active = 1 AND deleted_at IS NULL
+     ORDER BY em_id ASC`,
+    {},
+    options
+  );
+  return rows.map(r => (r.ext ? `${r.firstName} (${r.ext})` : r.firstName)).join(', ');
+}
+
+// Same labels ContractNoCell.jsx/RemarkBadge.jsx (contravct-web) already show next to
+// a Contract No. elsewhere in the app — kept as an independent local copy rather than
+// importing across the frontend/backend boundary (this codebase's existing
+// controller-to-controller isolation convention, same reasoning as request
+// Controller.js's own EDIT_STAGE_COLUMN comment).
+const REMARK_LABELS = {
+  new: 'New Contract',
+  renew: 'Renew Contract',
+  amend: 'Amend Contract',
+  claim: 'Claim Note',
+  terminate: 'Terminate',
+  cancel: 'Cancel Contract',
+};
+
+// The row list each of the 6 existing *.template.js files already hardcodes for its
+// own "waiting for approval" email — centralized here so the Approved/Return
+// notifications below (which apply to every remark type, not just 'new') can show the
+// same fields per type without duplicating that mapping a second time. `data` is
+// whatever buildContractEmailData already returned for that requestType — this only
+// arranges those same fields into {label, value} rows, no new data.
+function buildDisplayRows(requestType, data) {
+  switch (requestType) {
+    case 'NEW':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Purpose', value: data.purpose, caption: '(Brief Description & Background)' },
+        { label: 'Net Price', value: data.netPrice },
+        { label: 'Delivery', value: data.delivery },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    case 'RENEW':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Purpose', value: data.purpose },
+        { label: 'Original Period', value: data.originalPeriod },
+        { label: 'New Period', value: data.newPeriod },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    case 'AMENDMENT':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Reason', value: data.reason },
+        { label: 'Amended Detail', value: data.amendedDetail },
+        { label: 'Effective Date', value: data.effectiveDate },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    case 'TERMINATION':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Reason', value: data.reason },
+        { label: 'Effective Date', value: data.effectiveDate },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    case 'CLAIM_NOTE':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Reason', value: data.reason },
+        { label: 'Claim Detail', value: data.claimDetail },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    case 'CANCEL':
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Purpose', value: data.purpose },
+        { label: 'Reason', value: data.reason },
+        { label: 'Requestor', value: data.requestor },
+      ];
+    default:
+      return [
+        { label: 'Supplier', value: data.supplierName },
+        { label: 'Contract Type', value: data.contractType },
+        { label: 'Requestor', value: data.requestor },
+      ];
+  }
+}
+
+// Shared by notifyRequestorApproved/notifyRequestorReturned below — both need the
+// Requestor's own email, resolved from a fresh contract_types lookup + the same
+// per-remark field computation buildContractEmailData already does for the "waiting
+// for approval" emails (purpose/netPrice/delivery for NEW, originalPeriod/newPeriod
+// for RENEW, ...), just addressed TO the Requestor instead of an approver. Returns
+// null (never throws) when there's nothing to send to — email addresses are best-
+// effort, same as everywhere else in this file.
+async function buildRequestorNotificationData(existing, body, { contractNo, systemUrl }) {
+  const requestorEmail = await getEmployeeEmail(existing.created_by);
+  if (!requestorEmail) {
+    console.error(`Contract email sending failed: no email on file for requestor em_id "${existing.created_by}".`);
+    return null;
+  }
+
+  // remark can legitimately be 'waived' here (see buildContractEmailData's own
+  // comment) — buildContractEmailData now always returns real data (falling back to
+  // requestType 'OTHER' + the generic Supplier/Contract Type/Requestor rows) rather
+  // than null, so this never silently drops the notification.
+  const emailData = await buildContractEmailData({
+    body,
+    remark: existing.remark,
+    contractNo,
+    requestorName: existing.requestor_name,
+    approverEmail: requestorEmail,
+    linkedMasterId: existing.linked_master_id,
+    systemUrl,
+  });
+  if (!emailData) return null;
+
+  return { requestType: emailData.requestType, requestorEmail, emailData, rows: buildDisplayRows(emailData.requestType, emailData) };
+}
+
+// Approver 3's Approve completing any remark's chain (status -> 'Drafted',
+// approvalController.js) — the one contract-request email sent TO the Requestor
+// instead of an approver, CC'd to Section Head (the 3 approvers) and every Legal
+// user, with a Download Contract Documents link instead of an attachment (see
+// approvedContract.template.js). A Cancel completion never actually reaches this —
+// its own row flips straight to 'Cancelled', never 'Drafted' (see
+// approvalController.js's isCancelCompletion), so it never calls this at all.
+//
+// Same "never fail the caller, swallow and log" contract as
+// notifyApproverForContractRequest above.
+export async function notifyRequestorApproved(existing, body, { contractNo, systemUrl, contractRequestId }) {
+  try {
+    const notification = await buildRequestorNotificationData(existing, body, { contractNo, systemUrl });
+    if (!notification) return;
+    const { emailData, requestorEmail, rows } = notification;
+
+    // De-duplicated twice over: approverEmIds first (the same em_id often fills more
+    // than one approver slot in test/seed data), then the final cc list again (an
+    // approver who's also a Legal user — a real, valid combination — would otherwise
+    // get CC'd on the same address once from each list).
+    const approverEmIds = [...new Set([existing.approver1_em_id, existing.approver2_em_id, existing.approver3_em_id].filter(Boolean))];
+    const [approverEmails, legalEmails] = await Promise.all([Promise.all(approverEmIds.map(getEmployeeEmail)), getLegalEmails()]);
+    const cc = [...new Set([...approverEmails.filter(Boolean), ...legalEmails])];
+
+    // The frontend never actually sends `systemUrl` today (every caller passes
+    // body.systemUrl, which is always undefined) — sendContractRequestEmail falls back
+    // to config.systemUrl internally for the "Contract Online System" link text, but
+    // documentsUrl is built here, before that fallback runs, so it needs the same
+    // fallback applied directly or it'd build a bare "/contract-documents/..." path.
+    const documentsBaseUrl = (systemUrl || config.systemUrl || '').replace(/\/$/, '');
+
+    await sendContractRequestEmail({
+      requestType: 'APPROVED',
+      supplierName: body.supplierName || '',
+      requestor: emailData.requestor,
+      contractNo: contractNo || '',
+      // Contract No. only ever shows on the Approved email (by Return time no number
+      // has been minted yet — see notifyRequestorReturned) — prepended here rather
+      // than folded into buildDisplayRows, which every remark type otherwise shares
+      // unchanged between Approved and Return. Same caption drop as Return/Waived —
+      // the "(Brief Description & Background)" caption under Purpose is redundant now
+      // the contract's already Drafted.
+      rows: [
+        { label: 'Contract No.', value: `${contractNo || ''}${REMARK_LABELS[existing.remark] ? ` (${REMARK_LABELS[existing.remark]})` : ''}` },
+        ...rows.map(({ caption, ...row }) => row),
+      ],
+      approverEmail: requestorEmail,
+      cc,
+      systemUrl,
+      documentsUrl: `${documentsBaseUrl}/contract-documents/${encodeURIComponent(contractNo || '')}`,
+      contractRequestId,
+    });
+  } catch (error) {
+    console.error('Contract request requestor (Approved) notification failed:', error);
+  }
+}
+
+// An approver's Return completing a review pass (status -> 'Returned',
+// approvalController.js's returnRequest) — sent to the Requestor with the approver's
+// own comment (split into a numbered list, one item per non-empty line they typed) so
+// they know exactly what to fix before resubmitting. No CC (unlike Approved above —
+// nothing's actually finished yet, this stays between the requestor and whoever just
+// returned it), no Contract No. row (none has been minted at this point in any
+// remark's lifecycle — see notifyRequestorApproved's own comment on that).
+export async function notifyRequestorReturned(existing, body, { systemUrl, contractRequestId }) {
+  try {
+    const notification = await buildRequestorNotificationData(existing, body, { contractNo: existing.contract_no, systemUrl });
+    if (!notification) return;
+    const { emailData, requestorEmail, rows } = notification;
+
+    await sendContractRequestEmail({
+      requestType: 'RETURN',
+      supplierName: body.supplierName || '',
+      requestor: emailData.requestor,
+      // Unlike Approved/Waived, the Return email drops the "(Brief Description &
+      // Background)" caption under Purpose — the approver's own comment already
+      // explains what needs fixing, so it doesn't need to be restated here.
+      rows: rows.map(({ caption, ...row }) => row),
+      comments: splitComment(body.comment),
+      approverEmail: requestorEmail,
+      systemUrl,
+      contractRequestId,
+    });
+  } catch (error) {
+    console.error('Contract request requestor (Return) notification failed:', error);
+  }
+}
+
+// Shared by notifyRequestorReturned above and notifyRequestorWaived below — both show
+// the acting person's comment as one numbered list item per non-empty line they typed.
+function splitComment(comment) {
+  return String(comment || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+// A Manager (Approver 3, approvalController.js's waiveRequest) or Legal
+// (legalController.js's waiveLegalRequest) clicking Waive — the request skips
+// straight to Signed. Sent to the Requestor, CC'd to Section Head (the 3 approvers)
+// and every Legal user — same CC shape as Approved above — with the waive comment as
+// plain blue lines (splitComment above). The table is buildDisplayRows' own fields for
+// whichever remark this request is, minus Original/New Period (RENEW-only) and the
+// "(Brief Description & Background)" caption under Purpose (the waive comment already
+// explains the reason, same call already made for Return above) — and with no separate
+// Contract No. row (contractNo still drives the email's own subject line via
+// buildSubject, just not duplicated as a table row here).
+//
+// Same "never fail the caller, swallow and log" contract as every other notify*
+// function in this file.
+export async function notifyRequestorWaived(existing, body, { contractNo, waivedBy, systemUrl, contractRequestId }) {
+  try {
+    const notification = await buildRequestorNotificationData(existing, body, { contractNo, systemUrl });
+    if (!notification) return;
+    const { emailData, requestorEmail, rows } = notification;
+
+    // De-duplicated twice over — same reasoning as notifyRequestorApproved's own cc
+    // above: approverEmIds first, then the final merged cc list again (an approver
+    // who's also a Legal user would otherwise be CC'd twice on the same address).
+    const approverEmIds = [...new Set([existing.approver1_em_id, existing.approver2_em_id, existing.approver3_em_id].filter(Boolean))];
+    const [approverEmails, legalEmails] = await Promise.all([Promise.all(approverEmIds.map(getEmployeeEmail)), getLegalEmails()]);
+    const cc = [...new Set([...approverEmails.filter(Boolean), ...legalEmails])];
+
+    await sendContractRequestEmail({
+      requestType: 'WAIVED',
+      supplierName: body.supplierName || '',
+      requestor: emailData.requestor,
+      contractNo: contractNo || '',
+      waivedBy,
+      rows: rows
+        .filter(({ label }) => label !== 'Original Period' && label !== 'New Period')
+        .map(({ caption, ...row }) => row),
+      comments: splitComment(body.comment),
+      approverEmail: requestorEmail,
+      cc,
+      systemUrl,
+      contractRequestId,
+    });
+  } catch (error) {
+    console.error('Contract request requestor (Waived) notification failed:', error);
+  }
+}
+
+// A legal user clicking Comment in Legal Review Mode (Legal > Waiting,
+// legalController.js's commentOnLegalRequest) — sent to the Requestor, CC'd to the 3
+// approvers only (never Legal itself — Legal is the sender, their own contact info is
+// listed inside the email body instead via getActiveLegalContactsLine). `body.comment`
+// is the exact comment just submitted — this action IS that comment's creation, so
+// there's no separate "fetch the latest one" query needed.
+//
+// Also reused by legalController.js's Terminate action (same email, same recipients)
+// with `remarkLabel` explicitly passed as 'Terminate' — overriding what the target
+// row's own remark would otherwise resolve to (e.g. a Terminate on an already-Signed
+// 'new' contract should read "Legal Comment for Terminate", not "...for New
+// Contract"). The rows table itself is untouched by this override — it still reflects
+// existing.remark's real field shape (Purpose/Net Price/Delivery for 'new', etc.),
+// only the display label changes.
+//
+// Same "never fail the caller, swallow and log" contract as every other notify*
+// function in this file.
+export async function notifyRequestorLegalComment(existing, body, { systemUrl, remarkLabel, contractRequestId } = {}) {
+  try {
+    const notification = await buildRequestorNotificationData(existing, body, { contractNo: existing.contract_no, systemUrl });
+    if (!notification) return;
+    const { emailData, requestorEmail, rows } = notification;
+
+    const approverEmIds = [...new Set([existing.approver1_em_id, existing.approver2_em_id, existing.approver3_em_id].filter(Boolean))];
+    const [approverEmails, legalContactsLine] = await Promise.all([
+      Promise.all(approverEmIds.map(getEmployeeEmail)),
+      getActiveLegalContactsLine(),
+    ]);
+
+    await sendContractRequestEmail({
+      requestType: 'LEGAL_COMMENT',
+      supplierName: body.supplierName || '',
+      requestor: emailData.requestor,
+      contractNo: existing.contract_no || '',
+      remarkLabel: remarkLabel || REMARK_LABELS[existing.remark] || existing.remark,
+      // Same caption drop as Return/Waived — the comment already explains itself.
+      rows: rows.map(({ caption, ...row }) => row),
+      comments: splitComment(body.comment),
+      legalContactsLine,
+      approverEmail: requestorEmail,
+      cc: approverEmails.filter(Boolean),
+      systemUrl,
+      contractRequestId,
+    });
+  } catch (error) {
+    console.error('Contract request requestor (Legal Comment) notification failed:', error);
   }
 }

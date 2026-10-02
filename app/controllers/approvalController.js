@@ -1,7 +1,15 @@
 import { sequelize, select, exec, insert } from '../../config/mysql.js';
-import { updateEditableFields, insertComment, notifyApproverForContractRequest } from '../../helpers/contractRequestHelper.js';
+import {
+  updateEditableFields,
+  insertComment,
+  notifyApproverForContractRequest,
+  notifyRequestorApproved,
+  notifyRequestorReturned,
+  notifyRequestorWaived,
+} from '../../helpers/contractRequestHelper.js';
 import { ApiError } from '../utils/apiError.js';
 import { handleApprovalError } from '../middleware/errorHandler.js';
+import { logActivity } from '../utils/activityLog.js';
 
 // ---------------------------------------------------------------------------
 // Approval workflow (Waiting Approve screen) — Approve / Return / Reject / Waive,
@@ -267,7 +275,18 @@ async function approveRequest(id, body) {
       requestorName: existingForEmail.requestor_name,
       linkedMasterId: existingForEmail.linked_master_id,
       systemUrl: body.systemUrl,
+      contractRequestId: id,
     });
+  }
+
+  // Approver 3 completing ANY remark's chain — result.contractNo is the number just
+  // minted inside the transaction above (existingForEmail.contract_no is still the
+  // pre-mint value, same reasoning as the comment above). A Cancel completion never
+  // reaches this condition at all: isCancelCompletion sets its own row straight to
+  // 'Cancelled', so result.status is never 'Drafted' for it — no remark-based
+  // exclusion needed here beyond that.
+  if (result.status === 'Drafted' && result.contractNo) {
+    await notifyRequestorApproved(existingForEmail, body, { contractNo: result.contractNo, systemUrl: body.systemUrl, contractRequestId: id });
   }
 
   return result;
@@ -294,9 +313,17 @@ async function approveRequest(id, body) {
 async function waiveRequest(id, body) {
   if (!body.comment || !body.comment.trim()) throw new ApiError(400, 'Comment is required.');
 
-  return sequelize.transaction(async transaction => {
+  // Captured inside the transaction below, read again after it commits — same
+  // "notify only once the DB change has actually persisted" reasoning every other
+  // notify* trigger in this file already uses. existing.remark here is still the
+  // ORIGINAL remark (renew/amend/...), read before the UPDATE below overwrites it to
+  // 'waived' — exactly what notifyRequestorWaived needs to show the right row shape.
+  let existingForEmail = null;
+
+  const result = await sequelize.transaction(async transaction => {
     const options = { transaction };
     const existing = await lockRequest(id, options);
+    existingForEmail = existing;
 
     if (existing.status !== 'Waiting Approver 3') {
       throw new ApiError(400, `Cannot waive a request with status "${existing.status}".`);
@@ -336,14 +363,24 @@ async function waiveRequest(id, body) {
 
     return { id: Number(id), status: 'Signed', contractNo };
   });
+
+  await notifyRequestorWaived(existingForEmail, body, { contractNo: result.contractNo, waivedBy: 'Manager', systemUrl: body.systemUrl, contractRequestId: id });
+
+  return result;
 }
 
 async function returnRequest(id, body) {
   if (!body.comment || !body.comment.trim()) throw new ApiError(400, 'Comment is required.');
 
-  return sequelize.transaction(async transaction => {
+  // Captured inside the transaction below, read again after it commits — same
+  // "notify only once the DB change has actually persisted" reasoning approveRequest
+  // above already uses.
+  let existingForEmail = null;
+
+  const result = await sequelize.transaction(async transaction => {
     const options = { transaction };
     const existing = await lockRequest(id, options);
+    existingForEmail = existing;
 
     await updateEditableFields(id, body, 'Returned', options);
 
@@ -354,6 +391,10 @@ async function returnRequest(id, body) {
 
     return { id: Number(id), status: 'Returned' };
   });
+
+  await notifyRequestorReturned(existingForEmail, body, { systemUrl: body.systemUrl, contractRequestId: id });
+
+  return result;
 }
 
 async function rejectRequest(id, body) {
@@ -377,6 +418,7 @@ async function rejectRequest(id, body) {
 export async function approve(req, res) {
   try {
     const result = await approveRequest(req.params.id, req.body || {});
+    await logActivity(req, 'approve', { entityType: 'contract_request', entityId: Number(req.params.id), detail: result.status });
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);
@@ -386,6 +428,7 @@ export async function approve(req, res) {
 export async function waive(req, res) {
   try {
     const result = await waiveRequest(req.params.id, req.body || {});
+    await logActivity(req, 'waive', { entityType: 'contract_request', entityId: Number(req.params.id), detail: result.status });
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);
@@ -395,6 +438,7 @@ export async function waive(req, res) {
 export async function returnContract(req, res) {
   try {
     const result = await returnRequest(req.params.id, req.body || {});
+    await logActivity(req, 'return', { entityType: 'contract_request', entityId: Number(req.params.id), detail: result.status });
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);
@@ -404,6 +448,7 @@ export async function returnContract(req, res) {
 export async function reject(req, res) {
   try {
     const result = await rejectRequest(req.params.id, req.body || {});
+    await logActivity(req, 'reject', { entityType: 'contract_request', entityId: Number(req.params.id), detail: result.status });
     res.json(result);
   } catch (err) {
     handleApprovalError(err, res);

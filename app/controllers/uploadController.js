@@ -76,6 +76,20 @@ export async function downloadUpload(req, res) {
     return res.status(403).json({ message: 'You do not have permission to download this file.' });
   }
 
+  // storage_name on disk is a bare randomUUID() (see upload.js's own comment: no
+  // extension on purpose, so a leaked/guessed storage filename reveals nothing) — which
+  // means res.download()'s internal sendFile() can't mime-sniff a Content-Type from that
+  // path and always falls back to application/octet-stream. That's invisible to a plain
+  // <a download> (Content-Disposition: attachment, built from record.extension below,
+  // already forces the save dialog with the right name/extension either way), but it
+  // breaks viewing a file inline — fetching it as a Blob via axios picks up that
+  // Content-Type, so e.g. a PDF loaded into an <ifram>/<embed> for in-page preview
+  // (PdfViewerModal.jsx) comes back untyped and the browser downloads it instead of
+  // rendering it. res.type() does its own extension lookup (Express's own mime module,
+  // nothing new to import) against the file's REAL extension instead of the on-disk
+  // name, and res.download()/sendFile() only mime-sniffs when Content-Type isn't
+  // already set — so setting it first here fixes every caller, not just this one.
+  res.type(record.extension);
   res.download(path.join(uploadsDir, record.storageName), `${record.fileName}${record.extension}`);
 }
 

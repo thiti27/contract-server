@@ -113,6 +113,11 @@ export async function listContracts(req, res) {
               -- Contract/All Job/Home) can hide itself once legal_check = 1, same
               -- condition Legal > Waiting's own scope already uses server-side.
               c.legal_check AS legalCheck,
+              -- Home only (ContractTable.jsx's Original At column) — 0/1 toggle, combined
+              -- client-side with the section column above: false => requestor's own
+              -- section (owner), true => the literal "Legal". See
+              -- signedContractController.js's originalAt.
+              c.original_at_legal AS originalAtLegal,
               c.updated_by AS updatedBy, c.updated_name AS updatedName, c.updated_at AS updatedAt
        FROM contract_requests c
        LEFT JOIN contract_types ct ON ct.id = c.contract_type_id

@@ -1,4 +1,5 @@
 import { select, exec, insert } from '../../config/mysql.js';
+import { logActivity } from '../utils/activityLog.js';
 
 // ---------------------------------------------------------------------------
 // Settings > Role Management (/settings/role) — who's allowed to do what in this
@@ -35,7 +36,7 @@ export async function listRoles(req, res) {
 
   const rows = await select(
     `SELECT id, em_id AS emId, first_name AS firstName, last_name AS lastName,
-            view, admin, legal, active, updated_at AS updatedAt, updated_by AS updatedBy
+            view, admin, legal, ext, active, updated_at AS updatedAt, updated_by AS updatedBy
      FROM admin_users
      WHERE ${clauses.join(' AND ')}
      ORDER BY created_at DESC`,
@@ -54,7 +55,7 @@ export async function listRoles(req, res) {
 }
 
 export async function createRole(req, res) {
-  const { emId = '', firstName = '', lastName = '', view = false, admin = false, legal = false, updatedName } = req.body || {};
+  const { emId = '', firstName = '', lastName = '', view = false, admin = false, legal = false, ext = '', updatedName } = req.body || {};
 
   if (!emId.trim()) return res.status(400).json({ message: 'Employee is required.' });
   if (!firstName.trim() || !lastName.trim()) return res.status(400).json({ message: 'Employee name is required.' });
@@ -64,9 +65,12 @@ export async function createRole(req, res) {
     return res.status(400).json({ message: 'This employee already has a role assigned.' });
   }
 
+  // updated_at/updated_by start equal to created_at/created_by — NOW() is evaluated
+  // once per statement, so both timestamp columns land on the exact same value —
+  // rather than left NULL until this role's first actual edit.
   const id = await insert(
-    `INSERT INTO admin_users (em_id, first_name, last_name, view, admin, legal, created_by)
-     VALUES (:emId, :firstName, :lastName, :view, :admin, :legal, :createdBy)`,
+    `INSERT INTO admin_users (em_id, first_name, last_name, view, admin, legal, ext, created_at, created_by, updated_at, updated_by)
+     VALUES (:emId, :firstName, :lastName, :view, :admin, :legal, :ext, NOW(), :createdBy, NOW(), :createdBy)`,
     {
       emId,
       firstName,
@@ -74,9 +78,15 @@ export async function createRole(req, res) {
       view: view ? 1 : 0,
       admin: admin ? 1 : 0,
       legal: legal ? 1 : 0,
+      ext: ext.trim() || null,
       createdBy: updatedName || null,
     }
   );
+  await logActivity(req, 'role_create', {
+    entityType: 'admin_user',
+    entityId: id,
+    detail: `${emId} (${firstName} ${lastName}) — view:${!!view} admin:${!!admin} legal:${!!legal}`,
+  });
   res.status(201).json({ id });
 }
 
@@ -86,16 +96,25 @@ export async function updateRole(req, res) {
   const existing = await select(`SELECT id FROM admin_users WHERE id = :id AND deleted_at IS NULL`, { id: req.params.id });
   if (!existing.length) return res.status(404).json({ message: 'Role not found.' });
 
-  const { view, admin, legal, active, updatedName } = req.body || {};
+  const { view, admin, legal, ext, active, updatedName } = req.body || {};
   const sets = ['updated_at = NOW()', 'updated_by = :updatedBy'];
   const replacements = { id: req.params.id, updatedBy: updatedName || null };
 
   if (view !== undefined) { sets.push('view = :view'); replacements.view = view ? 1 : 0; }
   if (admin !== undefined) { sets.push('admin = :admin'); replacements.admin = admin ? 1 : 0; }
   if (legal !== undefined) { sets.push('legal = :legal'); replacements.legal = legal ? 1 : 0; }
+  if (ext !== undefined) { sets.push('ext = :ext'); replacements.ext = ext.trim() || null; }
   if (active !== undefined) { sets.push('active = :active'); replacements.active = active ? 1 : 0; }
 
   await exec(`UPDATE admin_users SET ${sets.join(', ')} WHERE id = :id`, replacements);
+  await logActivity(req, 'role_update', {
+    entityType: 'admin_user',
+    entityId: Number(req.params.id),
+    detail: Object.entries({ view, admin, legal, ext, active })
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${k}:${v}`)
+      .join(' '),
+  });
   res.json({ success: true });
 }
 
@@ -108,5 +127,6 @@ export async function deleteRole(req, res) {
     `UPDATE admin_users SET deleted_at = NOW(), deleted_by = :deletedBy, active = 0 WHERE id = :id`,
     { id: req.params.id, deletedBy: updatedName || null }
   );
+  await logActivity(req, 'role_delete', { entityType: 'admin_user', entityId: Number(req.params.id) });
   res.json({ success: true });
 }

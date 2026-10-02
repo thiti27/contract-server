@@ -1,6 +1,7 @@
 import bcrypt from 'bcrypt';
 import { select } from '../../config/mysql.js';
 import { sign } from '../../config/jwt.js';
+import { logActivity } from '../utils/activityLog.js';
 
 // Step 1 of login: company employees, kept in eds_db (a separate database on the same
 // MySQL server/connection — see the "why not a new connection" note in the refactor
@@ -78,10 +79,12 @@ export async function login(req, res) {
     if (employee) {
       const passwordMatches = employee.password ? await bcrypt.compare(password, employee.password) : false;
       if (!passwordMatches) {
+        await logActivity(req, 'login_failed', { emId: employee.em_id, userName: `${employee.firstname_en} ${employee.lastname_en}`.trim() });
         return res.status(401).json({ message: 'Username หรือ Password ไม่ถูกต้อง' });
       }
 
       const permissions = await getPermissions(employee.em_id);
+      await logActivity(req, 'login_success', { emId: employee.em_id, userName: `${employee.firstname_en} ${employee.lastname_en}`.trim() });
       return res.json(
         buildLoginResponse({
           id: employee.id,
@@ -97,6 +100,10 @@ export async function login(req, res) {
     // Step 2 — no employee found, fall back to the original app_users flow, unchanged.
     const user = await findAppUser(username);
     if (!user || user.password !== password) {
+      // No employee AND no app_user matched `username` at all — nobody to attach this
+      // attempt to, so em_id/userName stay null (logActivity's own default, not passed
+      // here) rather than logging the raw typed username as if it were a real identity.
+      await logActivity(req, 'login_failed', { emId: user?.em_id || null, userName: user ? `${user.first_name} ${user.last_name}`.trim() : null });
       return res.status(401).json({ message: 'Username หรือ Password ไม่ถูกต้อง' });
     }
 
@@ -104,6 +111,7 @@ export async function login(req, res) {
     // comes from looking their em_id up in admin_users. No match (or inactive) just
     // means no special permissions, not a login failure.
     const permissions = await getPermissions(user.em_id);
+    await logActivity(req, 'login_success', { emId: user.em_id, userName: `${user.first_name} ${user.last_name}`.trim() });
     res.json(
       buildLoginResponse({
         id: user.id,

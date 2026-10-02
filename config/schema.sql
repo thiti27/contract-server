@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS admin_users (
   view          TINYINT(1) NOT NULL DEFAULT 0,
   admin         TINYINT(1) NOT NULL DEFAULT 0,
   legal         TINYINT(1) NOT NULL DEFAULT 0,
+  ext           VARCHAR(20),   -- desk phone extension, Settings > Role Management's own "Ext" field
   active        TINYINT(1) NOT NULL DEFAULT 1,
 
   created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -131,11 +132,17 @@ CREATE TABLE IF NOT EXISTS file_uploads (
 -- the Download Form page header).
 -- =========================================================================
 CREATE TABLE IF NOT EXISTS contract_types (
-  id                    INT AUTO_INCREMENT PRIMARY KEY,
-  name                  VARCHAR(200) NOT NULL,
-  description           VARCHAR(500),
-  allow_custom_purpose  TINYINT(1) NOT NULL DEFAULT 0, -- true => Contract Purpose becomes free text
-  active                TINYINT(1) NOT NULL DEFAULT 1,
+  id                        INT AUTO_INCREMENT PRIMARY KEY,
+  name                      VARCHAR(200) NOT NULL,
+  description               VARCHAR(500),
+  allow_custom_purpose      TINYINT(1) NOT NULL DEFAULT 0, -- true => Contract Purpose becomes free text
+  check_construction_risk   TINYINT(1) NOT NULL DEFAULT 0, -- Settings > Contract Type checkbox: this contract type requires the Construction Risk Classification Checklist
+  -- Above this Total Net Price, the New Request form's Construction Risk Classification
+  -- Checklist popup is skipped entirely even though check_construction_risk is on (e.g.
+  -- 5,000,000 => contracts over 5MTHB don't need the checklist). NULL means no exemption
+  -- — always required whenever check_construction_risk is on, regardless of value.
+  construction_risk_exempt_above  DECIMAL(14, 2),
+  active                    TINYINT(1) NOT NULL DEFAULT 1,
 
   created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at            DATETIME,
@@ -153,6 +160,7 @@ CREATE TABLE IF NOT EXISTS contract_type_purposes (
   purpose_text      VARCHAR(300) NOT NULL,
   description       VARCHAR(500),
   active            TINYINT(1) NOT NULL DEFAULT 1,
+  risk_level        VARCHAR(10) DEFAULT NULL, -- 'high' / 'low' / NULL (unclassified) — Construction Risk Classification Checklist grouping, set from the parent contract type's Edit form
 
   created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at        DATETIME,
@@ -187,6 +195,22 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   contract_type_id    INT,
   contract_purpose    VARCHAR(300),        -- dropdown choice OR free text, per contract_types.allow_custom_purpose
   other_specify       VARCHAR(300),
+
+  -- Construction Risk Classification Checklist (FOPI-S35-LEG-001-014) — only collected
+  -- when contract_types.check_construction_risk is set for the selected type. Filled out
+  -- as a popup on the New Request form: 14 criteria, each scored Low Risk (1) / High Risk
+  -- (2); construction_risk_score is their sum (14-28); construction_risk_level is 'high'
+  -- when the sum >= 15, else 'low' (mirrors the source Excel's own threshold — a single
+  -- High Risk answer alone already reaches 15). contract_purpose above is then
+  -- auto-assigned from whichever of the selected contract type's purposes has that same
+  -- risk_level (see contract_type_purposes.risk_level) and the New Request form locks
+  -- Contract Purpose from manual edits once this is set — re-running the popup is the only
+  -- way to change it. construction_risk_answers keeps every row's own answer (not just the
+  -- total) as JSON, since the completed checklist must be reproducible as an Excel export
+  -- later, not just its final score.
+  construction_risk_level    VARCHAR(10),   -- 'high' / 'low' / NULL (not required, or not yet assessed)
+  construction_risk_score    INT,
+  construction_risk_answers  JSON,
 
   supplier_name       VARCHAR(300) NOT NULL,
   contract_no         VARCHAR(100),        -- NULL until officially issued
@@ -285,6 +309,15 @@ CREATE TABLE IF NOT EXISTS contract_requests (
   auto_renewal_years          INT,             -- only set when auto_renewal = 1
   renewal_condition           VARCHAR(500),    -- optional free text, only when has_expiry = 1
   reminder_before_expiry_days SMALLINT,        -- one of 15/30/45/60/90, only when has_expiry = 1 AND auto_renewal = 1
+
+  -- Home's Original At column (ContractTable.jsx, variant="browse") — only meaningful
+  -- once status = 'Signed'. 0 (default) = original is with the requestor's own section
+  -- (displayed as requestor_section, "owner"); 1 = confirmed physically at Legal
+  -- (displayed as the literal "Legal"). Toggled via the row's More menu ("Original At
+  -- Legal" / "Original At Owner", see signedContractController.js's setOriginalAtLegal)
+  -- — a plain confirm-and-flip, not free text, so the column only ever shows one of
+  -- exactly two states.
+  original_at_legal           TINYINT(1) NOT NULL DEFAULT 0,
 
   active              TINYINT(1) NOT NULL DEFAULT 1,
 
@@ -503,3 +536,63 @@ CREATE TABLE IF NOT EXISTS global_documents (
   updated_by    VARCHAR(6),
   deleted_by    VARCHAR(6)
 );
+
+
+-- =========================================================================
+-- Scheduled email log — full audit trail + dedup/catch-up record for the two
+-- automated cron jobs (app/jobs/draftedTracking.job.js,
+-- app/jobs/expirationReminder.job.js). One row per SEND ATTEMPT (success or
+-- failure), not just the latest state — Legal can see exactly who a
+-- notification went to, which contract_requests.id(s) it covered, and whether
+-- it actually went out. Before sending, a job checks whether (job_type,
+-- entity_key) already has a status='success' row; a day the server was down
+-- over an actual trigger date still catches up correctly next run, since only
+-- the presence of a successful row (not just any attempt) counts as "already
+-- sent" — a failed attempt (e.g. no email on file) never blocks tomorrow's retry.
+--   drafted_tracking:    entity_key = "{requestor_section}_{year}_{round}"
+--                         (round = round1/round2/round3) — one send per
+--                         section per round per year, since the same still-
+--                         Drafted contracts must re-notify every year they stay
+--                         unsigned. contract_request_ids holds every contract
+--                         listed in that section's email.
+--   expiration_reminder: entity_key = contract_no — sent exactly once per
+--                         contract, ever. contract_request_ids is a single-id array.
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS scheduled_email_log (
+  id                    INT AUTO_INCREMENT PRIMARY KEY,
+  job_type              VARCHAR(50) NOT NULL,
+  entity_key            VARCHAR(150) NOT NULL,
+  contract_request_ids  JSON,             -- contract_requests.id(s) this send covered
+  recipient_to          TEXT,             -- comma-separated email(s) actually sent to
+  recipient_cc          TEXT,             -- comma-separated cc email(s)
+  status                VARCHAR(20) NOT NULL DEFAULT 'success', -- 'success' | 'failed'
+  error_message         TEXT,             -- set when status = 'failed'
+  sent_at               DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+-- Index created in config/mysql.js's migrateScheduledEmailLogColumns, not here — this
+-- table pre-dates the `status` column on some already-running databases, and this
+-- file's statements all run unconditionally on every startup (see runSchema), so an
+-- index referencing `status` here would fail on those until the migration has run.
+
+
+-- =========================================================================
+-- Activity log — system-wide audit trail, separate from contract_approval_history/
+-- contract_legal_history (which only cover their own narrow slice of one contract
+-- request's lifecycle and don't include login, Settings, or upload events at all).
+-- Append-only: no soft delete, nothing is ever edited once written. See
+-- app/utils/activityLog.js for the single write path every caller goes through.
+-- =========================================================================
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id            INT AUTO_INCREMENT PRIMARY KEY,
+  em_id         VARCHAR(6),         -- NULL for a failed login against an unknown username
+  user_name     VARCHAR(255),       -- display name snapshot at the time of the action
+  action        VARCHAR(50) NOT NULL,
+  entity_type   VARCHAR(50),        -- 'contract_request' | 'admin_user' | 'contract_type' | ... ; NULL for login
+  entity_id     INT,
+  detail        TEXT,               -- short human-readable summary (contract no., old -> new values, etc.)
+  ip_address    VARCHAR(45),
+  created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_activity_logs_created_at ON activity_logs (created_at);
+CREATE INDEX idx_activity_logs_em_id ON activity_logs (em_id);
+CREATE INDEX idx_activity_logs_action ON activity_logs (action);

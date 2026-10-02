@@ -12,8 +12,10 @@ export default {
   EMAIL_HOST: '10.227.101.30',
   EMAIL_PORT: 25,
   EMAIL_FROM: 'Contract_Online@dsst.Daicel.com',
-  // Placeholder until the real deployed URL is known — every caller can still override
-  // this per-email via data.systemUrl (see contractEmail.service.js), so this default
-  // only matters when a caller doesn't pass one.
-  SYSTEM_URL: 'https://contract-online.example.com',
+  // The real deployed Contract Online System web app (frontend on port 7012, distinct
+  // from this server's own PORT 1312 above) — every caller can still override this
+  // per-email via data.systemUrl (see contractEmail.service.js), so this default only
+  // matters when a caller doesn't pass one, which today is every caller (the frontend
+  // never actually sends systemUrl — see notifyRequestorApproved's own comment on that).
+  SYSTEM_URL: 'http://localhost:5173/',
 };

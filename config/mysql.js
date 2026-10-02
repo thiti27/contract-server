@@ -177,6 +177,62 @@ async function migrateSignedContractColumns() {
 }
 
 // One-time additive migration for databases created before contract_requests grew
+// original_at_legal (Home's Original At column toggle — see signedContractController.js's
+// setOriginalAtLegal) — present in schema.sql's CREATE TABLE for fresh databases, same
+// idiom as migrateSignedContractColumns above.
+async function migrateOriginalAtColumn() {
+  try {
+    await exec(
+      `ALTER TABLE contract_requests ADD COLUMN original_at_legal TINYINT(1) NOT NULL DEFAULT 0 AFTER reminder_before_expiry_days`
+    );
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
+// check_construction_risk (Settings > Contract Type checkbox — this contract type
+// requires the Construction Risk Classification Checklist) — lives on contract_types
+// itself (not per-purpose), right next to allow_custom_purpose since both are
+// New-Request-form-affecting flags set on the same Add/Edit Contract Type form.
+// Present in schema.sql's CREATE TABLE for fresh databases, same idiom as
+// migrateOriginalAtColumn above.
+async function migrateConstructionRiskColumn() {
+  try {
+    await exec(`ALTER TABLE contract_types ADD COLUMN check_construction_risk TINYINT(1) NOT NULL DEFAULT 0 AFTER allow_custom_purpose`);
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
+// construction_risk_exempt_above — above this Total Net Price, the Construction Risk
+// Classification Checklist popup is skipped even when check_construction_risk is on
+// (see schema.sql's own comment on this column). Present in schema.sql's CREATE TABLE
+// for fresh databases, same idiom as migrateConstructionRiskColumn above.
+async function migrateConstructionRiskExemptColumn() {
+  try {
+    await exec(`ALTER TABLE contract_types ADD COLUMN construction_risk_exempt_above DECIMAL(14, 2) AFTER check_construction_risk`);
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
+// risk_level ('high' / 'low' / NULL) — per-purpose Construction Risk Classification
+// grouping, set from the High/Low pickers on the parent contract type's Edit form
+// (only shown once check_construction_risk above is checked). Present in schema.sql's
+// CREATE TABLE for fresh databases, same idiom as migrateOriginalAtColumn above.
+async function migrateRiskLevelColumn() {
+  try {
+    await exec(`ALTER TABLE contract_type_purposes ADD COLUMN risk_level VARCHAR(10) DEFAULT NULL AFTER active`);
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
+// One-time additive migration for databases created before contract_requests grew
 // action_background/action_detail (ActionInfoSection.jsx's "___ Information" section,
 // shown for Renew/Amend/Claim Note/Terminate requests) — present in schema.sql's CREATE
 // TABLE for fresh databases, same idiom as migrateSignedContractColumns above.
@@ -192,6 +248,25 @@ async function migrateActionInfoColumns() {
 
   await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN action_background TEXT AFTER brief_description`);
   await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN action_detail TEXT AFTER action_background`);
+}
+
+// construction_risk_level/score/answers — the New Request form's Construction Risk
+// Classification Checklist popup (see schema.sql's own comment on these columns for the
+// full scoring/auto-purpose rules). Present in schema.sql's CREATE TABLE for fresh
+// databases, same idiom as migrateActionInfoColumns above.
+async function migrateConstructionRiskAssessmentColumns() {
+  const tryAddColumn = async sql => {
+    try {
+      await exec(sql);
+    } catch (err) {
+      if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+      throw err;
+    }
+  };
+
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN construction_risk_level VARCHAR(10) AFTER other_specify`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN construction_risk_score INT AFTER construction_risk_level`);
+  await tryAddColumn(`ALTER TABLE contract_requests ADD COLUMN construction_risk_answers JSON AFTER construction_risk_score`);
 }
 
 // One-time additive migration for databases created before contract_requests grew
@@ -328,6 +403,18 @@ async function migrateAdminUsersAuditColumns() {
   await exec(`ALTER TABLE admin_users MODIFY COLUMN deleted_by VARCHAR(150)`);
 }
 
+// ext — desk phone extension, Settings > Role Management's own "Ext" field. Present
+// in schema.sql's CREATE TABLE for fresh databases, same idiom as
+// migrateConstructionRiskColumn above.
+async function migrateAdminUsersExtColumn() {
+  try {
+    await exec(`ALTER TABLE admin_users ADD COLUMN ext VARCHAR(20) AFTER legal`);
+  } catch (err) {
+    if (err.original?.code === 'ER_DUP_FIELDNAME') return;
+    throw err;
+  }
+}
+
 // One-time data fix for rows already saved with the old 'Canceled' (single L) status
 // spelling, from before every reference to it (HISTORY_STATUSES, StatusBadge,
 // EDIT_ACTION_STATUS, legalController's Cancel/Terminate action, the Cancel-completion
@@ -350,6 +437,52 @@ async function migrateCancelledSpelling() {
 // max+1. Deliberately never INSERTs a new year row — generateContractNo's own
 // INSERT ... ON DUPLICATE KEY already creates one lazily the first time a year is
 // actually used, this only corrects rows that already exist.
+// Widens scheduled_email_log (created earlier this session as a bare dedup marker:
+// id/job_type/entity_key/sent_at with a UNIQUE KEY on job_type+entity_key) into a full
+// audit trail — one row per send ATTEMPT, success or failure, recording who it went
+// to, which contract_requests.id(s) it covered, and the outcome. The old unique key
+// assumed exactly one row per entity; that's no longer true (a failed attempt and a
+// later successful retry are now both kept), so it's dropped here. No-ops on a fresh
+// DB, which already gets this shape directly from schema.sql.
+async function migrateScheduledEmailLogColumns() {
+  const cols = await select(
+    `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'scheduled_email_log'`
+  );
+  const has = name => cols.some(c => c.name === name);
+
+  if (!has('contract_request_ids')) {
+    await exec(`ALTER TABLE scheduled_email_log ADD COLUMN contract_request_ids JSON AFTER entity_key`);
+  }
+  if (!has('recipient_to')) {
+    await exec(`ALTER TABLE scheduled_email_log ADD COLUMN recipient_to TEXT AFTER contract_request_ids`);
+  }
+  if (!has('recipient_cc')) {
+    await exec(`ALTER TABLE scheduled_email_log ADD COLUMN recipient_cc TEXT AFTER recipient_to`);
+  }
+  if (!has('status')) {
+    await exec(`ALTER TABLE scheduled_email_log ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'success' AFTER recipient_cc`);
+  }
+  if (!has('error_message')) {
+    await exec(`ALTER TABLE scheduled_email_log ADD COLUMN error_message TEXT AFTER status`);
+  }
+
+  try {
+    await exec(`ALTER TABLE scheduled_email_log DROP INDEX uq_scheduled_email_log`);
+  } catch (err) {
+    if (err.original?.code !== 'ER_CANT_DROP_FIELD_OR_KEY') throw err;
+  }
+
+  // Run every startup (idempotent) rather than from schema.sql's unconditional
+  // statement list — schema.sql runs before this migration, so an index referencing
+  // `status` there would fail on a database that hasn't gained that column yet.
+  try {
+    await exec(`CREATE INDEX idx_scheduled_email_log_lookup ON scheduled_email_log (job_type, entity_key, status)`);
+  } catch (err) {
+    if (err.original?.code !== 'ER_DUP_KEYNAME') throw err;
+  }
+}
+
 async function reconcileContractNoSequences() {
   await exec(`
     UPDATE contract_no_sequences s
@@ -536,7 +669,12 @@ export async function initDatabase() {
   await migrateLegalCheckColumn();
   await migrateGlobalDocumentColumns();
   await migrateSignedContractColumns();
+  await migrateOriginalAtColumn();
+  await migrateConstructionRiskColumn();
+  await migrateConstructionRiskExemptColumn();
+  await migrateRiskLevelColumn();
   await migrateActionInfoColumns();
+  await migrateConstructionRiskAssessmentColumns();
   await migrateRemarkDetailColumns();
   await migrateCancelRemark();
   await migrateWaivedRemark();
@@ -544,7 +682,9 @@ export async function initDatabase() {
   await migrateWaiveAction('contract_approval_history');
   await migrateLinkedMasterIdColumn();
   await migrateAdminUsersAuditColumns();
+  await migrateAdminUsersExtColumn();
   await migrateCancelledSpelling();
+  await migrateScheduledEmailLogColumns();
   await seedEmployees();
   await seedAdminUsers();
   await seedAppUsers();
